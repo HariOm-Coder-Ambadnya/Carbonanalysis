@@ -1,0 +1,12 @@
+scenario_id,scenario_order,deadline_minutes,predicted,correct
+scenario_046,46,15,15,True
+scenario_047,47,15,15,True
+scenario_048,48,15,15,True
+scenario_049,49,60,15,False
+scenario_050,50,15,15,True
+scenario_051,51,15,15,True
+scenario_052,52,15,15,True
+scenario_053,53,15,15,True
+scenario_054,54,15,15,True
+scenario_055,55,15,15,True
+scenario_056,56,15,15,True

@@ -1,0 +1,1884 @@
+
+
+================================================
+FILE: Coding/LoadBalancing/baseline_scheduler.py
+================================================
+
+import pandas as pd
+import numpy as np
+
+from config import OUTPUT_DIR
+
+
+# --------------------------------------------------
+# 1. LOAD CLASSIFIED WORKLOAD
+# --------------------------------------------------
+
+def load_classified_workload():
+
+    input_file = OUTPUT_DIR / "classified_workload.csv"
+
+    print("Loading classified workload...")
+
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Classified workload not found: {input_file}"
+        )
+
+    df = pd.read_csv(input_file)
+
+    required_columns = [
+        "app",
+        "func",
+        "end_timestamp",
+        "duration",
+        "start_timestamp",
+        "workload_type"
+    ]
+
+    for column in required_columns:
+        if column not in df.columns:
+            raise ValueError(
+                f"Missing required column: {column}"
+            )
+
+    print(f"Loaded invocations: {len(df):,}")
+
+    return df
+
+
+# --------------------------------------------------
+# 2. EXECUTE BASELINE SCHEDULING
+# --------------------------------------------------
+
+def schedule_baseline(df):
+
+    print("\nExecuting baseline scheduling...")
+
+    scheduled = df.copy()
+
+    # Baseline executes every invocation at its original
+    # calculated start time. No intentional postponement.
+    scheduled["scheduled_start_timestamp"] = (
+        scheduled["start_timestamp"]
+    )
+
+    scheduled["scheduled_end_timestamp"] = (
+        scheduled["scheduled_start_timestamp"]
+        + scheduled["duration"]
+    )
+
+    # No intentional waiting
+    scheduled["waiting_time_seconds"] = 0.0
+
+    # Record the scheduling strategy
+    scheduled["scheduling_strategy"] = "BASELINE"
+
+    return scheduled
+
+
+# --------------------------------------------------
+# 3. VALIDATE BASELINE SCHEDULE
+# --------------------------------------------------
+
+def validate_baseline(scheduled):
+
+    print("\nVALIDATING BASELINE SCHEDULE")
+    print("============================")
+
+    # Every invocation must be preserved
+    assert len(scheduled) == 1_980_951, (
+        "Invocation count has changed."
+    )
+
+    # No missing scheduled timestamps
+    assert scheduled[
+        "scheduled_start_timestamp"
+    ].notna().all(), (
+        "Missing scheduled start timestamps."
+    )
+
+    # Original start times must be preserved
+    assert np.allclose(
+        scheduled["scheduled_start_timestamp"],
+        scheduled["start_timestamp"]
+    ), "Baseline changed original start times."
+
+    # Waiting time must be zero
+    assert (
+        scheduled["waiting_time_seconds"] == 0
+    ).all(), "Baseline contains unexpected waiting time."
+
+    # Execution duration must be preserved
+    assert np.allclose(
+        scheduled["scheduled_end_timestamp"]
+        - scheduled["scheduled_start_timestamp"],
+        scheduled["duration"]
+    ), "Execution duration has changed."
+
+    # Workload categories must be preserved
+    assert (
+        scheduled["workload_type"].notna().all()
+    ), "Workload categories are missing."
+
+    print("PASS: All original invocations preserved.")
+    print("PASS: Original start times preserved.")
+    print("PASS: No intentional scheduling delay.")
+    print("PASS: Execution durations preserved.")
+    print("PASS: Workload categories preserved.")
+
+    print("\nAll baseline validation checks passed.")
+
+
+# --------------------------------------------------
+# 4. GENERATE BASELINE SUMMARY
+# --------------------------------------------------
+
+def generate_baseline_summary(scheduled):
+
+    summary = (
+        scheduled.groupby("workload_type")
+        .agg(
+            invocation_count=("duration", "count"),
+            average_duration=("duration", "mean"),
+            total_execution_seconds=("duration", "sum"),
+            average_waiting_seconds=(
+                "waiting_time_seconds", "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    summary["percentage"] = (
+        summary["invocation_count"]
+        / len(scheduled)
+        * 100
+    )
+
+    return summary
+
+
+# --------------------------------------------------
+# 5. SAVE BASELINE RESULTS
+# --------------------------------------------------
+
+def save_results(scheduled, summary):
+
+    output_file = (
+        OUTPUT_DIR / "baseline_schedule.csv"
+    )
+
+    summary_file = (
+        OUTPUT_DIR / "baseline_schedule_summary.csv"
+    )
+
+    scheduled.to_csv(
+        output_file,
+        index=False
+    )
+
+    summary.to_csv(
+        summary_file,
+        index=False
+    )
+
+    print("\nBASELINE RESULTS SAVED")
+
+    print(f"Schedule: {output_file}")
+    print(f"Summary: {summary_file}")
+
+
+# --------------------------------------------------
+# 6. MAIN EXECUTION
+# --------------------------------------------------
+
+def main():
+
+    df = load_classified_workload()
+
+    scheduled = schedule_baseline(df)
+
+    validate_baseline(scheduled)
+
+    summary = generate_baseline_summary(scheduled)
+
+    print("\nBASELINE SCHEDULING SUMMARY")
+    print("===========================")
+
+    print(summary.to_string(index=False))
+
+    save_results(scheduled, summary)
+
+    print("\nBASELINE SCHEDULING COMPLETED!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: Coding/LoadBalancing/capacity_constrained_scheduler.py
+================================================
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parents[2]
+
+RESULT_DIR = (
+    ROOT / "Coding" / "LoadBalancing" / "results"
+)
+
+INPUT_FILE = RESULT_DIR / "classified_workload.csv"
+
+CARBON_FILE = (
+    ROOT / "Coding" / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = RESULT_DIR / "capacity_constrained"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEADLINES = [15, 30, 60]
+
+CAPACITY_PER_INSTANCE = 20
+
+# Experimental ceiling derived from observed baseline peak.
+MAX_CONCURRENCY = 3027
+
+# One-minute execution-work budget, in execution-seconds.
+CAPACITY_BUDGET = MAX_CONCURRENCY * 60
+
+
+# ============================================================
+# LOAD INPUTS
+# ============================================================
+
+def load_inputs():
+
+    jobs = pd.read_csv(INPUT_FILE)
+    carbon = pd.read_csv(CARBON_FILE)
+
+    required_job_columns = [
+        "start_timestamp",
+        "duration",
+        "workload_type"
+    ]
+
+    for col in required_job_columns:
+        if col not in jobs.columns:
+            raise ValueError(
+                f"Missing job column: {col}"
+            )
+
+    if "carbon_intensity_lifecycle" not in carbon.columns:
+        raise ValueError(
+            "Missing carbon_intensity_lifecycle column."
+        )
+
+    jobs["start_timestamp"] = pd.to_numeric(
+        jobs["start_timestamp"], errors="coerce"
+    )
+
+    jobs["duration"] = pd.to_numeric(
+        jobs["duration"], errors="coerce"
+    )
+
+    if jobs[["start_timestamp", "duration"]].isna().any().any():
+        raise ValueError("Invalid job timestamps or durations.")
+
+    jobs["workload_type"] = (
+        jobs["workload_type"].astype(str).str.upper()
+    )
+
+    valid_types = {"IMMEDIATE", "DELAY_TOLERANT"}
+
+    if not set(jobs["workload_type"].unique()).issubset(valid_types):
+        raise ValueError(
+            "Unexpected workload_type values: "
+            f"{jobs['workload_type'].unique()}"
+        )
+
+    carbon = carbon.sort_values("minute").reset_index(drop=True)
+
+    carbon_values = carbon[
+        "carbon_intensity_lifecycle"
+    ].to_numpy(dtype=float)
+
+    if not np.isfinite(carbon_values).all():
+        raise ValueError("Invalid carbon intensity values.")
+
+    return jobs, carbon_values
+
+
+# ============================================================
+# EXECUTION-WORK ACCOUNTING
+# ============================================================
+
+def add_execution_work(load, start, duration):
+    """
+    Assign each invocation's execution seconds to its
+    scheduled start minute.
+
+    This is a per-minute execution-work approximation.
+    It is not an exact instantaneous concurrency model.
+    """
+
+    if duration <= 0:
+        return
+
+    minute = int(start // 60)
+
+    if 0 <= minute < len(load):
+        load[minute] += duration
+
+
+def can_accept(load, minute, duration):
+
+    if duration <= 0:
+        return True
+
+    if minute < 0 or minute >= len(load):
+        return False
+
+    return (
+        load[minute] + duration
+        <= CAPACITY_BUDGET
+    )
+
+
+# ============================================================
+# CREATE CAPACITY-CONSTRAINED SCHEDULE
+# ============================================================
+
+def schedule_jobs(jobs, carbon_values, deadline):
+
+    jobs = jobs.copy()
+
+    jobs["original_start_timestamp"] = (
+        jobs["start_timestamp"]
+    )
+
+    jobs["scheduled_start_timestamp"] = (
+        jobs["start_timestamp"]
+    )
+
+    jobs["original_minute"] = (
+        jobs["start_timestamp"] // 60
+    ).astype(int)
+
+    jobs["scheduled_minute"] = jobs["original_minute"]
+
+    jobs["waiting_time_seconds"] = 0.0
+
+    jobs["original_carbon_intensity"] = [
+        carbon_values[m]
+        for m in jobs["original_minute"]
+    ]
+
+    jobs["scheduled_carbon_intensity"] = (
+        jobs["original_carbon_intensity"]
+    )
+
+    # Track execution work already assigned to each minute.
+    minute_load = np.zeros(
+        len(carbon_values),
+        dtype=float
+    )
+
+    immediate_mask = (
+        jobs["workload_type"] == "IMMEDIATE"
+    )
+
+    tolerant_mask = (
+        jobs["workload_type"] == "DELAY_TOLERANT"
+    )
+
+    # Immediate jobs are never moved.
+    immediate = jobs.loc[immediate_mask]
+
+    for start, duration in zip(
+        immediate["scheduled_start_timestamp"],
+        immediate["duration"]
+    ):
+        add_execution_work(
+            minute_load, start, duration
+        )
+
+    # Process delay-tolerant jobs in original arrival order.
+    tolerant_indices = jobs.index[tolerant_mask]
+
+    tolerant = jobs.loc[tolerant_indices].sort_values(
+        "original_start_timestamp"
+    )
+
+    delayed_count = 0
+
+    for idx, row in tolerant.iterrows():
+
+        original_start = float(
+            row["original_start_timestamp"]
+        )
+
+        duration = float(row["duration"])
+
+        original_minute = int(
+            original_start // 60
+        )
+
+        original_carbon = carbon_values[original_minute]
+
+        # Candidate start times preserve the original
+        # second offset within the minute.
+        original_offset = original_start % 60
+
+        first_candidate = original_minute
+        last_candidate = min(
+            original_minute + deadline,
+            len(carbon_values) - 1
+        )
+
+        candidates = list(
+            range(first_candidate, last_candidate + 1)
+        )
+
+        # Prefer lower-carbon candidates, but only accept
+        # a candidate if its execution-work budget permits it.
+        candidates.sort(
+            key=lambda m: (carbon_values[m], m)
+        )
+
+        selected_minute = original_minute
+
+        for candidate_minute in candidates:
+
+            candidate_start = (
+                candidate_minute * 60 + original_offset
+            )
+
+            waiting = candidate_start - original_start
+
+            if waiting < 0 or waiting > deadline * 60:
+                continue
+
+            # Do not move to a higher-carbon minute.
+            if (
+                carbon_values[candidate_minute]
+                > original_carbon
+            ):
+                continue
+
+            if can_accept(
+                minute_load,
+                candidate_minute,
+                duration
+            ):
+                selected_minute = candidate_minute
+                break
+
+        selected_start = (
+            selected_minute * 60 + original_offset
+        )
+
+        add_execution_work(
+            minute_load,
+            selected_start,
+            duration
+        )
+
+        jobs.at[
+            idx, "scheduled_start_timestamp"
+        ] = selected_start
+
+        jobs.at[
+            idx, "scheduled_minute"
+        ] = selected_minute
+
+        jobs.at[
+            idx, "waiting_time_seconds"
+        ] = selected_start - original_start
+
+        jobs.at[
+            idx, "scheduled_carbon_intensity"
+        ] = carbon_values[selected_minute]
+
+        if selected_start > original_start:
+            delayed_count += 1
+
+    jobs["scheduled_end_timestamp"] = (
+        jobs["scheduled_start_timestamp"]
+        + jobs["duration"]
+    )
+
+    jobs["scheduling_strategy"] = (
+        f"CAPACITY_CONSTRAINED_{deadline}MIN"
+    )
+
+    # Per-minute execution-work equivalent concurrency.
+    average_equivalent = minute_load / 60
+
+    summary = {
+        "deadline_minutes": deadline,
+        "total_invocations": len(jobs),
+        "immediate_invocations": int(immediate_mask.sum()),
+        "delay_tolerant_invocations": int(tolerant_mask.sum()),
+        "delayed_invocations": delayed_count,
+        "delayed_percentage": (
+            delayed_count / max(int(tolerant_mask.sum()), 1)
+        ) * 100,
+        "average_waiting_seconds": jobs.loc[
+            tolerant_mask, "waiting_time_seconds"
+        ].mean(),
+        "maximum_waiting_seconds": jobs[
+            "waiting_time_seconds"
+        ].max(),
+        "average_original_carbon_intensity": (
+            jobs["original_carbon_intensity"].mean()
+        ),
+        "average_scheduled_carbon_intensity": (
+            jobs["scheduled_carbon_intensity"].mean()
+        ),
+        "execution_work_peak_equivalent_concurrency": (
+            average_equivalent.max()
+        ),
+        "execution_work_budget": MAX_CONCURRENCY
+    }
+
+    return jobs, summary
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_schedule(schedule, deadline):
+
+    immediate = schedule[
+        schedule["workload_type"] == "IMMEDIATE"
+    ]
+
+    tolerant = schedule[
+        schedule["workload_type"] == "DELAY_TOLERANT"
+    ]
+
+    assert (
+        schedule["scheduled_start_timestamp"]
+        >= schedule["original_start_timestamp"]
+    ).all()
+
+    assert (
+        schedule["waiting_time_seconds"] <= deadline * 60 + 0.001
+    ).all()
+
+    assert np.allclose(
+        schedule["scheduled_end_timestamp"],
+        schedule["scheduled_start_timestamp"]
+        + schedule["duration"]
+    )
+
+    assert np.allclose(
+        immediate["scheduled_start_timestamp"],
+        immediate["original_start_timestamp"]
+    )
+
+    assert (
+        tolerant["scheduled_carbon_intensity"]
+        <= tolerant["original_carbon_intensity"] + 1e-9
+    ).all()
+
+    print("PASS: Schedule validation completed.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("\nCAPACITY-CONSTRAINED CARBON-AWARE SCHEDULER")
+    print("=" * 55)
+
+    jobs, carbon_values = load_inputs()
+
+    print(f"Total jobs: {len(jobs):,}")
+    print(f"Carbon timeline: {len(carbon_values):,} minutes")
+    print(f"Experimental concurrency ceiling: {MAX_CONCURRENCY:,}")
+    print(f"Per-minute execution-work budget: {CAPACITY_BUDGET:,.0f} seconds")
+
+    summaries = []
+
+    for deadline in DEADLINES:
+
+        print(f"\nRUNNING {deadline}-MINUTE SCENARIO")
+        print("-" * 45)
+
+        schedule, summary = schedule_jobs(
+            jobs,
+            carbon_values,
+            deadline
+        )
+
+        validate_schedule(schedule, deadline)
+
+        output_file = (
+            OUTPUT_DIR
+            / f"capacity_constrained_schedule_{deadline}min.csv"
+        )
+
+        schedule.to_csv(output_file, index=False)
+
+        summaries.append(summary)
+
+        print(
+            f"Delayed jobs: {summary['delayed_invocations']:,}"
+        )
+
+        print(
+            "Average waiting: "
+            f"{summary['average_waiting_seconds']:.2f} seconds"
+        )
+
+        print(
+            "Average carbon intensity: "
+            f"{summary['average_original_carbon_intensity']:.2f}"
+            " -> "
+            f"{summary['average_scheduled_carbon_intensity']:.2f}"
+        )
+
+        print(
+            "Peak execution-work equivalent concurrency: "
+            f"{summary['execution_work_peak_equivalent_concurrency']:.2f}"
+        )
+
+        print(f"Saved: {output_file}")
+
+    summary_df = pd.DataFrame(summaries)
+
+    summary_file = (
+        OUTPUT_DIR / "capacity_constrained_summary.csv"
+    )
+
+    summary_df.to_csv(summary_file, index=False)
+
+    print("\nALL SCENARIOS COMPLETED")
+    print("=" * 55)
+
+    print(summary_df.to_string(index=False))
+    print(f"\nSaved: {summary_file}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: Coding/EnergyModel/energy_model_config.py
+================================================
+
+"""
+Energy Model Configuration
+
+IMPORTANT:
+All power and concurrency values below are experimental assumptions.
+They are NOT official Azure Functions hardware specifications.
+
+Replace or validate them against suitable research literature before
+using the results as final research findings.
+"""
+
+INPUT_FILE = (
+    "Coding/CarbonAnalysis/workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = "Coding/EnergyModel/results"
+
+# Each simulated instance is assumed to handle this many
+# concurrent invocations.
+SCENARIOS = {
+    "capacity_10": {
+        "concurrency_capacity": 10,
+        "idle_power_w": 34.0,
+        "peak_power_w": 125.0
+    },
+
+    "capacity_20": {
+        "concurrency_capacity": 20,
+        "idle_power_w": 44.0,
+        "peak_power_w": 125.0
+    },
+
+    "capacity_50": {
+        "concurrency_capacity": 50,
+        "idle_power_w": 44.0,
+        "peak_power_w": 140.0
+    }
+}
+
+# Each record represents one minute.
+INTERVAL_SECONDS = 60
+
+# Carbon intensity unit: grams of CO2 equivalent per kWh.
+CARBON_UNIT = "gCO2eq/kWh"
+
+PRIMARY_CARBON_COLUMN = "carbon_intensity_lifecycle"
+SECONDARY_CARBON_COLUMN = "carbon_intensity_direct"
+
+
+
+================================================
+FILE: Coding/EnergyModel/EnergyEstimation.py
+================================================
+
+import os
+import math
+import pandas as pd
+
+from energy_model_config import (
+    INPUT_FILE,
+    OUTPUT_DIR,
+    SCENARIOS,
+    INTERVAL_SECONDS,
+    PRIMARY_CARBON_COLUMN,
+    SECONDARY_CARBON_COLUMN
+)
+
+
+def load_dataset():
+    """Load and validate the merged workload-carbon dataset."""
+
+    print("Loading workload-carbon dataset...")
+
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(
+            f"Input dataset not found: {INPUT_FILE}"
+        )
+
+    df = pd.read_csv(INPUT_FILE)
+
+    required_columns = [
+        "minute",
+        "invocation_count",
+        "average_concurrency",
+        "maximum_concurrency",
+        PRIMARY_CARBON_COLUMN,
+        SECONDARY_CARBON_COLUMN
+    ]
+
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns: {missing_columns}"
+        )
+
+    numeric_columns = [
+        "minute",
+        "invocation_count",
+        "average_concurrency",
+        "maximum_concurrency",
+        PRIMARY_CARBON_COLUMN,
+        SECONDARY_CARBON_COLUMN
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column], errors="coerce"
+        )
+
+    if df[numeric_columns].isnull().any().any():
+        raise ValueError(
+            "Missing or invalid values found in required columns."
+        )
+
+    if (df["average_concurrency"] < 0).any():
+        raise ValueError("Negative average concurrency found.")
+
+    if (df["maximum_concurrency"] < 0).any():
+        raise ValueError("Negative maximum concurrency found.")
+
+    if (df[PRIMARY_CARBON_COLUMN] < 0).any():
+        raise ValueError("Negative lifecycle carbon intensity found.")
+
+    if (df[SECONDARY_CARBON_COLUMN] < 0).any():
+        raise ValueError("Negative direct carbon intensity found.")
+
+    if (df["average_concurrency"] >
+            df["maximum_concurrency"] + 0.000001).any():
+        raise ValueError(
+            "Average concurrency exceeds maximum concurrency."
+        )
+
+    if df["minute"].duplicated().any():
+        raise ValueError("Duplicate minute records found.")
+
+    df = df.sort_values("minute").reset_index(drop=True)
+
+    print(f"Dataset loaded: {len(df)} records")
+
+    return df
+
+
+def estimate_energy(df, scenario_name, config):
+    """
+    Estimate energy for one scenario.
+
+    Instance count is based on maximum concurrency.
+    Utilisation is a concurrency-capacity proxy, NOT measured CPU usage.
+
+    The model assumes the provisioned instances remain available
+    for the entire one-minute interval.
+    """
+
+    capacity = config["concurrency_capacity"]
+    idle_power = config["idle_power_w"]
+    peak_power = config["peak_power_w"]
+
+    if capacity <= 0:
+        raise ValueError("Concurrency capacity must be positive.")
+
+    if idle_power < 0 or peak_power < idle_power:
+        raise ValueError("Invalid power configuration.")
+
+    result = df.copy()
+
+    instance_counts = []
+    utilisation_values = []
+    total_power_values = []
+    energy_wh_values = []
+    energy_kwh_values = []
+
+    for _, row in result.iterrows():
+
+        average_concurrency = row["average_concurrency"]
+        maximum_concurrency = row["maximum_concurrency"]
+
+        # No active workload means no provisioned instances
+        # in this simplified scale-to-zero simulation.
+        if maximum_concurrency == 0:
+            instance_count = 0
+            utilisation = 0.0
+            total_power = 0.0
+            energy_wh = 0.0
+
+        else:
+            # Required instances based on peak concurrency.
+            instance_count = math.ceil(
+                maximum_concurrency / capacity
+            )
+
+            # Concurrency-based capacity utilisation proxy.
+            total_capacity = instance_count * capacity
+
+            utilisation = min(
+                average_concurrency / total_capacity,
+                1.0
+            )
+
+            # Simplified linear power model.
+            power_per_instance = (
+                idle_power
+                + utilisation * (peak_power - idle_power)
+            )
+
+            total_power = (
+                instance_count * power_per_instance
+            )
+
+            # Energy = Power x Time.
+            energy_wh = (
+                total_power * INTERVAL_SECONDS / 3600
+            )
+
+        energy_kwh = energy_wh / 1000
+
+        instance_counts.append(instance_count)
+        utilisation_values.append(utilisation)
+        total_power_values.append(total_power)
+        energy_wh_values.append(energy_wh)
+        energy_kwh_values.append(energy_kwh)
+
+    result[f"{scenario_name}_instance_count"] = instance_counts
+
+    result[f"{scenario_name}_utilisation_proxy"] = (
+        utilisation_values
+    )
+
+    result[f"{scenario_name}_power_w"] = total_power_values
+
+    result[f"{scenario_name}_energy_wh"] = energy_wh_values
+
+    result[f"{scenario_name}_energy_kwh"] = energy_kwh_values
+
+    # Carbon emissions using lifecycle carbon intensity.
+    result[f"{scenario_name}_carbon_lifecycle_g"] = (
+        result[f"{scenario_name}_energy_kwh"]
+        * result[PRIMARY_CARBON_COLUMN]
+    )
+
+    # Carbon emissions using direct carbon intensity.
+    result[f"{scenario_name}_carbon_direct_g"] = (
+        result[f"{scenario_name}_energy_kwh"]
+        * result[SECONDARY_CARBON_COLUMN]
+    )
+
+    return result
+
+
+def create_summary(results):
+    """Create one summary row for each scenario."""
+
+    summary_rows = []
+
+    for scenario_name in SCENARIOS:
+
+        summary_rows.append({
+            "scenario": scenario_name,
+
+            "total_energy_kwh":
+                results[f"{scenario_name}_energy_kwh"].sum(),
+
+            "average_power_w":
+                results[f"{scenario_name}_power_w"].mean(),
+
+            "peak_power_w":
+                results[f"{scenario_name}_power_w"].max(),
+
+            "total_lifecycle_carbon_g":
+                results[
+                    f"{scenario_name}_carbon_lifecycle_g"
+                ].sum(),
+
+            "total_direct_carbon_g":
+                results[
+                    f"{scenario_name}_carbon_direct_g"
+                ].sum(),
+
+            "maximum_instances":
+                results[
+                    f"{scenario_name}_instance_count"
+                ].max(),
+
+            "average_instances":
+                results[
+                    f"{scenario_name}_instance_count"
+                ].mean()
+        })
+
+    return pd.DataFrame(summary_rows)
+
+
+def main():
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df = load_dataset()
+
+    print("\nStarting energy estimation...")
+
+    results = df.copy()
+
+    for scenario_name, config in SCENARIOS.items():
+
+        print(f"Processing scenario: {scenario_name}")
+
+        results = estimate_energy(
+            results,
+            scenario_name,
+            config
+        )
+
+    # Save minute-level energy and carbon estimates.
+    detailed_file = os.path.join(
+        OUTPUT_DIR,
+        "energy_carbon_estimates.csv"
+    )
+
+    results.to_csv(detailed_file, index=False)
+
+    # Generate scenario-level summary.
+    summary = create_summary(results)
+
+    summary_file = os.path.join(
+        OUTPUT_DIR,
+        "energy_carbon_summary.csv"
+    )
+
+    summary.to_csv(summary_file, index=False)
+
+    print("\n" + "=" * 60)
+    print("ENERGY ESTIMATION COMPLETED")
+    print("=" * 60)
+
+    print(f"Processed intervals: {len(results)}")
+
+    print("\nScenario Summary:")
+    print(summary.to_string(index=False))
+
+    print("\nSaved detailed results:")
+    print(os.path.abspath(detailed_file))
+
+    print("\nSaved scenario summary:")
+    print(os.path.abspath(summary_file))
+
+    print("\nIMPORTANT:")
+    print(
+        "These are model-based estimates using assumed "
+        "power and concurrency parameters."
+    )
+    print(
+        "Concurrency utilisation is not measured CPU utilisation."
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: Coding/EnergyModel/TimeAwareEnergyEstimation.py
+================================================
+
+import os
+import math
+import numpy as np
+import pandas as pd
+
+from energy_model_config import SCENARIOS
+
+# Original Azure Functions invocation trace
+INPUT_FILE = (
+    "AzureFunctionsInvocationTraceForTwoWeeksJan2021/"
+    "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt"
+)
+
+OUTPUT_DIR = "Coding/EnergyModel/results"
+
+TOTAL_MINUTES = 20160
+INTERVAL_SECONDS = 60
+TOTAL_SECONDS = TOTAL_MINUTES * INTERVAL_SECONDS
+
+
+def load_invocations():
+
+    print("Loading original invocation trace...")
+
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(INPUT_FILE)
+
+    df = pd.read_csv(INPUT_FILE)
+
+    required = [
+        "app",
+        "func",
+        "end_timestamp",
+        "duration"
+    ]
+
+    if not all(col in df.columns for col in required):
+        raise ValueError("Unexpected invocation trace columns.")
+
+    df["end_timestamp"] = pd.to_numeric(
+        df["end_timestamp"], errors="coerce"
+    )
+
+    df["duration"] = pd.to_numeric(
+        df["duration"], errors="coerce"
+    )
+
+    if df[["end_timestamp", "duration"]].isnull().any().any():
+        raise ValueError("Invalid timestamps or durations found.")
+
+    if (df["duration"] < 0).any():
+        raise ValueError("Negative invocation duration found.")
+
+    # Derive invocation start timestamp.
+    df["start_timestamp"] = (
+        df["end_timestamp"] - df["duration"]
+    )
+
+    # Positive-duration invocations only.
+    # Zero-duration invocations consume no modelled execution time.
+    df = df[df["duration"] > 0].copy()
+
+    # Keep events inside the reconstructed 14-day observation window.
+    df = df[
+        (df["start_timestamp"] >= 0)
+        & (df["end_timestamp"] <= TOTAL_SECONDS)
+    ].copy()
+
+    print(f"Positive-duration invocations: {len(df)}")
+
+    return df
+
+
+def create_events(df):
+
+    print("Generating start and completion events...")
+
+    starts = df["start_timestamp"].to_numpy()
+    ends = df["end_timestamp"].to_numpy()
+
+    event_times = np.concatenate([starts, ends])
+
+    event_changes = np.concatenate([
+        np.ones(len(starts), dtype=np.int64),
+        -np.ones(len(ends), dtype=np.int64)
+    ])
+
+    events = pd.DataFrame({
+        "time": event_times,
+        "change": event_changes
+    })
+
+    # Combine events at identical timestamps.
+    events = (
+        events.groupby("time", as_index=False)["change"]
+        .sum()
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    print(f"Unique event timestamps: {len(events)}")
+
+    return events
+
+
+def calculate_scenario(events, scenario_name, config):
+
+    capacity = config["concurrency_capacity"]
+    idle_power = config["idle_power_w"]
+    peak_power = config["peak_power_w"]
+
+    if capacity <= 0:
+        raise ValueError("Invalid concurrency capacity.")
+
+    if idle_power < 0 or peak_power < idle_power:
+        raise ValueError("Invalid power parameters.")
+
+    # Energy accumulated in every minute, in Wh.
+    minute_energy_wh = np.zeros(TOTAL_MINUTES)
+
+    # Track the highest number of instances per minute.
+    minute_max_instances = np.zeros(
+        TOTAL_MINUTES, dtype=np.int64
+    )
+
+    active_invocations = 0
+    previous_time = 0.0
+
+    for row in events.itertuples(index=False):
+
+        current_time = float(row.time)
+
+        # Integrate the state before applying events at current_time.
+        if current_time > previous_time:
+
+            if active_invocations > 0:
+
+                instance_count = math.ceil(
+                    active_invocations / capacity
+                )
+
+                utilisation = min(
+                    active_invocations /
+                    (instance_count * capacity),
+                    1.0
+                )
+
+                power_per_instance = (
+                    idle_power
+                    + utilisation * (peak_power - idle_power)
+                )
+
+                total_power = (
+                    instance_count * power_per_instance
+                )
+
+                # Split energy across minute boundaries.
+                segment_start = previous_time
+
+                while segment_start < current_time:
+
+                    minute_index = int(
+                        segment_start // INTERVAL_SECONDS
+                    )
+
+                    minute_end = min(
+                        (minute_index + 1) * INTERVAL_SECONDS,
+                        current_time
+                    )
+
+                    segment_duration = (
+                        minute_end - segment_start
+                    )
+
+                    energy_wh = (
+                        total_power * segment_duration / 3600
+                    )
+
+                    minute_energy_wh[minute_index] += energy_wh
+
+                    minute_max_instances[minute_index] = max(
+                        minute_max_instances[minute_index],
+                        instance_count
+                    )
+
+                    segment_start = minute_end
+
+        # Apply all changes at the current timestamp.
+        active_invocations += int(row.change)
+
+        if active_invocations < 0:
+            raise ValueError(
+                f"Negative concurrency at {current_time}"
+            )
+
+        previous_time = current_time
+
+    if active_invocations != 0:
+        raise ValueError(
+            "Unclosed invocations remain after event processing."
+        )
+
+    # Convert Wh to kWh.
+    minute_energy_kwh = minute_energy_wh / 1000
+
+    return {
+        f"{scenario_name}_energy_wh": minute_energy_wh,
+        f"{scenario_name}_energy_kwh": minute_energy_kwh,
+        f"{scenario_name}_maximum_instances": minute_max_instances
+    }
+
+
+def main():
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    invocations = load_invocations()
+
+    events = create_events(invocations)
+
+    results = pd.DataFrame({
+        "minute": np.arange(TOTAL_MINUTES)
+    })
+
+    print("\nRunning time-aware energy model...")
+
+    for scenario_name, config in SCENARIOS.items():
+
+        print(f"Processing {scenario_name}...")
+
+        scenario_results = calculate_scenario(
+            events,
+            scenario_name,
+            config
+        )
+
+        for column, values in scenario_results.items():
+            results[column] = values
+
+    # Merge carbon intensity from the validated dataset.
+    carbon_file = (
+        "Coding/CarbonAnalysis/workload_carbon_dataset.csv"
+    )
+
+    carbon_df = pd.read_csv(carbon_file)
+
+    if len(carbon_df) != TOTAL_MINUTES:
+        raise ValueError("Unexpected carbon dataset size.")
+
+    results["carbon_intensity_lifecycle"] = (
+        carbon_df["carbon_intensity_lifecycle"]
+    )
+
+    results["carbon_intensity_direct"] = (
+        carbon_df["carbon_intensity_direct"]
+    )
+
+    # Calculate emissions for every scenario.
+    for scenario_name in SCENARIOS:
+
+        results[
+            f"{scenario_name}_carbon_lifecycle_g"
+        ] = (
+            results[f"{scenario_name}_energy_kwh"]
+            * results["carbon_intensity_lifecycle"]
+        )
+
+        results[
+            f"{scenario_name}_carbon_direct_g"
+        ] = (
+            results[f"{scenario_name}_energy_kwh"]
+            * results["carbon_intensity_direct"]
+        )
+
+    # Save detailed minute-level results.
+    detailed_path = os.path.join(
+        OUTPUT_DIR,
+        "time_aware_energy_estimates.csv"
+    )
+
+    results.to_csv(detailed_path, index=False)
+
+    # Create summary.
+    summary_rows = []
+
+    for scenario_name in SCENARIOS:
+
+        summary_rows.append({
+
+            "scenario": scenario_name,
+
+            "total_energy_kwh": results[
+                f"{scenario_name}_energy_kwh"
+            ].sum(),
+
+            "total_lifecycle_carbon_kg": (
+                results[
+                    f"{scenario_name}_carbon_lifecycle_g"
+                ].sum() / 1000
+            ),
+
+            "total_direct_carbon_kg": (
+                results[
+                    f"{scenario_name}_carbon_direct_g"
+                ].sum() / 1000
+            ),
+
+            "maximum_instances": results[
+                f"{scenario_name}_maximum_instances"
+            ].max()
+
+        })
+
+    summary = pd.DataFrame(summary_rows)
+
+    summary_path = os.path.join(
+        OUTPUT_DIR,
+        "time_aware_energy_summary.csv"
+    )
+
+    summary.to_csv(summary_path, index=False)
+
+    print("\n" + "=" * 65)
+    print("TIME-AWARE ENERGY ESTIMATION COMPLETED")
+    print("=" * 65)
+
+    print(f"Processed minutes: {len(results)}")
+
+    print("\nScenario summary:")
+    print(summary.to_string(index=False))
+
+    print("\nDetailed output:")
+    print(os.path.abspath(detailed_path))
+
+    print("\nSummary output:")
+    print(os.path.abspath(summary_path))
+
+    print(
+        "\nNOTE: This is a simulated provisioning model. "
+        "It does not reproduce Azure's actual autoscaling."
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: Coding/AzureCostModel/azure_cost_config.py
+================================================
+
+from pathlib import Path
+
+# Project root: Cloud_G45_Project
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Original Azure Functions invocation trace
+INPUT_FILE = (
+    PROJECT_ROOT
+    / "AzureFunctionsInvocationTraceForTwoWeeksJan2021"
+    / "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt"
+)
+
+OUTPUT_DIR = PROJECT_ROOT / "Coding" / "AzureCostModel" / "results"
+
+# Reconstructed trace timeline.
+# This is an assumption used in the existing project timeline.
+TRACE_START_UTC = "2021-01-31 00:00:00"
+
+# Azure Functions Consumption pricing reference assumptions.
+# Verify region-specific rates before presenting them as a price quote.
+COST_CURRENCY = "USD"
+
+# Reference rates used by the model.
+# Keep these configurable because Azure pricing can change.
+EXECUTION_PRICE_PER_MILLION = 0.20
+PRICE_PER_GB_SECOND = 0.000016
+
+# Documented Consumption-plan monthly free grants.
+FREE_EXECUTIONS_PER_MONTH = 1_000_000
+FREE_GB_SECONDS_PER_MONTH = 400_000
+
+# Assumed memory allocations, in MB.
+# These are sensitivity scenarios, NOT measured memory usage.
+MEMORY_SCENARIOS_MB = [512, 1024, 1536]
+
+# Azure Consumption billing assumptions.
+MEMORY_ROUNDING_MB = 128
+MAX_BILLABLE_MEMORY_MB = 1536
+MIN_EXECUTION_DURATION_SECONDS = 0.100
+DURATION_ROUNDING_SECONDS = 0.001
+
+# If True, calculate illustrative cost after monthly free grants.
+# Assumes this trace is the only workload consuming the subscription grants.
+CALCULATE_FREE_GRANT_SCENARIO = True
+
+
+
+================================================
+FILE: Coding/AzureCostModel/AzureCostEstimation.py
+================================================
+
+import math
+import pandas as pd
+
+from pathlib import Path
+
+from azure_cost_config import (
+    INPUT_FILE,
+    OUTPUT_DIR,
+    TRACE_START_UTC,
+    COST_CURRENCY,
+    EXECUTION_PRICE_PER_MILLION,
+    PRICE_PER_GB_SECOND,
+    FREE_EXECUTIONS_PER_MONTH,
+    FREE_GB_SECONDS_PER_MONTH,
+    MEMORY_SCENARIOS_MB,
+    MEMORY_ROUNDING_MB,
+    MAX_BILLABLE_MEMORY_MB,
+    MIN_EXECUTION_DURATION_SECONDS,
+    DURATION_ROUNDING_SECONDS,
+    CALCULATE_FREE_GRANT_SCENARIO,
+)
+
+
+def round_up(value, unit):
+    """Round a positive value up to the next billing unit."""
+    return math.ceil(value / unit) * unit
+
+
+def calculate_billable_duration(duration):
+    """
+    Apply the configured billing assumptions:
+    - Minimum duration: 100 ms
+    - Duration rounding: 1 ms
+    """
+    duration = max(
+        float(duration),
+        MIN_EXECUTION_DURATION_SECONDS
+    )
+
+    return round_up(
+        duration,
+        DURATION_ROUNDING_SECONDS
+    )
+
+
+def calculate_billable_memory(memory_mb):
+    """Round memory up to the next 128 MB increment."""
+    if memory_mb <= 0:
+        raise ValueError("Memory allocation must be positive.")
+
+    rounded_memory = round_up(
+        memory_mb,
+        MEMORY_ROUNDING_MB
+    )
+
+    return min(
+        rounded_memory,
+        MAX_BILLABLE_MEMORY_MB
+    )
+
+
+def load_invocation_trace():
+    print("Loading original Azure Functions trace...")
+
+    if not Path(INPUT_FILE).exists():
+        raise FileNotFoundError(
+            f"Input trace not found: {INPUT_FILE}"
+        )
+
+    df = pd.read_csv(INPUT_FILE)
+
+    required_columns = {
+        "app",
+        "func",
+        "end_timestamp",
+        "duration",
+    }
+
+    missing_columns = required_columns - set(df.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing columns: {missing_columns}"
+        )
+
+    print(f"Original records: {len(df):,}")
+
+    # Preserve original records, including duplicates and zero durations.
+    df = df.copy()
+
+    df["end_timestamp"] = pd.to_numeric(
+        df["end_timestamp"],
+        errors="raise"
+    )
+
+    df["duration"] = pd.to_numeric(
+        df["duration"],
+        errors="raise"
+    )
+
+    if df[["end_timestamp", "duration"]].isna().any().any():
+        raise ValueError("Missing timestamp or duration values found.")
+
+    if (df["duration"] < 0).any():
+        raise ValueError("Negative execution durations found.")
+
+    if (df["end_timestamp"] < 0).any():
+        raise ValueError("Negative completion timestamps found.")
+
+    trace_start = pd.Timestamp(
+        TRACE_START_UTC,
+        tz="UTC"
+    )
+
+    df["end_datetime_utc"] = (
+        trace_start
+        + pd.to_timedelta(
+            df["end_timestamp"],
+            unit="s"
+        )
+    )
+
+    # Group by completion month for illustrative monthly grants.
+    df["billing_month"] = (
+        df["end_datetime_utc"]
+        .dt.strftime("%Y-%m")
+    )
+
+    # Minute-level aggregation key.
+    df["minute"] = (
+        df["end_timestamp"] // 60
+    ).astype(int)
+
+    return df
+
+
+def calculate_scenario(df, memory_mb):
+    print(f"Processing memory scenario: {memory_mb} MB")
+
+    result = df[
+        [
+            "minute",
+            "billing_month",
+            "end_datetime_utc",
+            "duration",
+        ]
+    ].copy()
+
+    result["assumed_memory_mb"] = memory_mb
+
+    result["billable_memory_mb"] = (
+        result["assumed_memory_mb"]
+        .apply(calculate_billable_memory)
+    )
+
+    result["billable_duration_seconds"] = (
+        result["duration"]
+        .apply(calculate_billable_duration)
+    )
+
+    # GB-seconds = memory in GB * billable duration.
+    result["gb_seconds"] = (
+        result["billable_memory_mb"] / 1024
+    ) * result["billable_duration_seconds"]
+
+    # Per-invocation execution charge.
+    result["execution_charge_usd"] = (
+        EXECUTION_PRICE_PER_MILLION / 1_000_000
+    )
+
+    # Per-invocation resource charge.
+    result["resource_charge_usd"] = (
+        result["gb_seconds"] * PRICE_PER_GB_SECOND
+    )
+
+    result["gross_cost_usd"] = (
+        result["execution_charge_usd"]
+        + result["resource_charge_usd"]
+    )
+
+    return result
+
+
+def create_minute_summary(result, memory_mb):
+    """Aggregate gross estimated costs by minute."""
+
+    summary = (
+        result.groupby("minute")
+        .agg(
+            invocation_count=("minute", "size"),
+            total_gb_seconds=("gb_seconds", "sum"),
+            total_execution_charge_usd=(
+                "execution_charge_usd", "sum"
+            ),
+            total_resource_charge_usd=(
+                "resource_charge_usd", "sum"
+            ),
+            total_gross_cost_usd=(
+                "gross_cost_usd", "sum"
+            ),
+        )
+        .reset_index()
+    )
+
+    summary["memory_mb"] = memory_mb
+
+    return summary
+
+
+def create_monthly_summary(result, memory_mb):
+    """
+    Apply monthly free grants separately to each calendar month.
+
+    This is illustrative and assumes this trace is the only
+    workload consuming the subscription's free grants.
+    """
+
+    monthly = (
+        result.groupby("billing_month")
+        .agg(
+            invocation_count=("billing_month", "size"),
+            total_gb_seconds=("gb_seconds", "sum"),
+            gross_execution_charge_usd=(
+                "execution_charge_usd", "sum"
+            ),
+            gross_resource_charge_usd=(
+                "resource_charge_usd", "sum"
+            ),
+            gross_total_cost_usd=(
+                "gross_cost_usd", "sum"
+            ),
+        )
+        .reset_index()
+    )
+
+    # Apply grants only when enabled in configuration.
+    if CALCULATE_FREE_GRANT_SCENARIO:
+        free_executions = FREE_EXECUTIONS_PER_MONTH
+        free_gb_seconds = FREE_GB_SECONDS_PER_MONTH
+    else:
+        free_executions = 0
+        free_gb_seconds = 0
+
+    monthly["free_execution_grant"] = free_executions
+    monthly["free_gb_second_grant"] = free_gb_seconds
+
+    monthly["billable_executions_after_grant"] = (
+        monthly["invocation_count"] - free_executions
+    ).clip(lower=0)
+
+    monthly["billable_gb_seconds_after_grant"] = (
+        monthly["total_gb_seconds"] - free_gb_seconds
+    ).clip(lower=0)
+
+    monthly["net_execution_charge_usd"] = (
+        monthly["billable_executions_after_grant"]
+        * EXECUTION_PRICE_PER_MILLION
+        / 1_000_000
+    )
+
+    monthly["net_resource_charge_usd"] = (
+        monthly["billable_gb_seconds_after_grant"]
+        * PRICE_PER_GB_SECOND
+    )
+
+    monthly["net_total_cost_usd"] = (
+        monthly["net_execution_charge_usd"]
+        + monthly["net_resource_charge_usd"]
+    )
+
+    monthly["memory_mb"] = memory_mb
+
+    return monthly
+
+
+def create_scenario_summary(
+    result,
+    monthly_summary,
+    memory_mb
+):
+    gross_execution_cost = (
+        result["execution_charge_usd"].sum()
+    )
+
+    gross_resource_cost = (
+        result["resource_charge_usd"].sum()
+    )
+
+    gross_total_cost = (
+        result["gross_cost_usd"].sum()
+    )
+
+    net_total_cost = (
+        monthly_summary["net_total_cost_usd"].sum()
+    )
+
+    return {
+        "memory_mb": memory_mb,
+        "total_invocations": len(result),
+        "total_gb_seconds": result["gb_seconds"].sum(),
+        "gross_execution_cost_usd": gross_execution_cost,
+        "gross_resource_cost_usd": gross_resource_cost,
+        "gross_total_cost_usd": gross_total_cost,
+        "net_cost_after_illustrative_grants_usd": net_total_cost,
+        "currency": COST_CURRENCY,
+    }
+
+
+def main():
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    df = load_invocation_trace()
+
+    scenario_summaries = []
+    all_minute_summaries = []
+    all_monthly_summaries = []
+
+    for memory_mb in MEMORY_SCENARIOS_MB:
+
+        result = calculate_scenario(
+            df,
+            memory_mb
+        )
+
+        minute_summary = create_minute_summary(
+            result,
+            memory_mb
+        )
+
+        monthly_summary = create_monthly_summary(
+            result,
+            memory_mb
+        )
+
+        scenario_summary = create_scenario_summary(
+            result,
+            monthly_summary,
+            memory_mb
+        )
+
+        scenario_summaries.append(scenario_summary)
+        all_minute_summaries.append(minute_summary)
+        all_monthly_summaries.append(monthly_summary)
+
+        # Save invocation-level details.
+        result.to_csv(
+            OUTPUT_DIR / f"cost_details_{memory_mb}MB.csv",
+            index=False
+        )
+
+    final_summary = pd.DataFrame(
+        scenario_summaries
+    )
+
+    minute_output = pd.concat(
+        all_minute_summaries,
+        ignore_index=True
+    )
+
+    monthly_output = pd.concat(
+        all_monthly_summaries,
+        ignore_index=True
+    )
+
+    # Save all reports.
+    final_summary.to_csv(
+        OUTPUT_DIR / "azure_cost_summary.csv",
+        index=False
+    )
+
+    minute_output.to_csv(
+        OUTPUT_DIR / "azure_cost_minute_summary.csv",
+        index=False
+    )
+
+    monthly_output.to_csv(
+        OUTPUT_DIR / "azure_cost_monthly_summary.csv",
+        index=False
+    )
+
+    print("\nAZURE FUNCTIONS COST ESTIMATION COMPLETED")
+    print("=" * 65)
+
+    print(f"Total invocations: {len(df):,}")
+    print(f"Memory scenarios: {MEMORY_SCENARIOS_MB}")
+    print(f"Currency: {COST_CURRENCY}")
+    print(
+        "Free grant scenario:",
+        CALCULATE_FREE_GRANT_SCENARIO
+    )
+
+    print("\nSCENARIO SUMMARY")
+    print("=" * 65)
+
+    print(
+        final_summary.to_string(index=False)
+    )
+
+    print("\nMONTHLY BREAKDOWN")
+    print("=" * 65)
+
+    print(
+        monthly_output[
+            [
+                "billing_month",
+                "memory_mb",
+                "invocation_count",
+                "total_gb_seconds",
+                "gross_total_cost_usd",
+                "net_total_cost_usd",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\nSaved files:")
+    print(OUTPUT_DIR / "azure_cost_summary.csv")
+    print(OUTPUT_DIR / "azure_cost_minute_summary.csv")
+    print(OUTPUT_DIR / "azure_cost_monthly_summary.csv")
+
+    print("\nCost estimation finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
+

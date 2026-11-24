@@ -1,0 +1,25 @@
+Metric,Value
+Total intervals,20160.0
+Active intervals,20139.0
+Idle intervals,21.0
+Idle percentage,0.10416666666666667
+Total invocations,1980951.0
+Minimum invocations per minute,0.0
+Maximum invocations per minute,3358.0
+Mean invocations per minute,98.26145833333334
+Median invocations per minute,58.0
+95th percentile invocations,278.0
+Standard deviation,149.39810601116218
+Coefficient of variation,1.5204140926176515
+Total execution time (seconds),6632112.277
+Overall weighted average duration (seconds),3.3479436275808943
+Mean of minute-level average durations (seconds),4.159715160926667
+Median of minute-level average durations (seconds),0.92115
+Maximum minute-level average duration (seconds),264.7176666666667
+Mean of minute-level P95 durations (seconds),15.941580992104864
+Maximum minute-level P95 duration (seconds),527.8607499999999
+95th percentile of minute-level P95 durations (seconds),68.53927999999999
+Peak workload minute,15282.0
+Peak workload hour,254.7
+Peak invocation count,3358.0
+Execution time during peak minute (seconds),601.13

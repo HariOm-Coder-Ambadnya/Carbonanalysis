@@ -1,0 +1,4299 @@
+
+
+================================================
+FILE: Coding/LoadBalancing/config.py
+================================================
+
+from pathlib import Path
+
+# --------------------------------------------------
+# PROJECT PATHS
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Aggregated dataset containing workload and carbon information
+INPUT_FILE = (
+    PROJECT_ROOT
+    / "Coding"
+    / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+# Original Azure Functions invocation trace
+RAW_WORKLOAD_FILE = (
+    PROJECT_ROOT
+    / "AzureFunctionsInvocationTraceForTwoWeeksJan2021"
+    / "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt"
+)
+
+# Load balancing output directory
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "Coding"
+    / "LoadBalancing"
+    / "results"
+)
+
+
+# --------------------------------------------------
+# SIMULATION CONFIGURATION
+# --------------------------------------------------
+
+INTERVAL_SECONDS = 60
+
+# Initial simulated workload classification
+IMMEDIATE_WORKLOAD_PERCENTAGE = 0.70
+DELAY_TOLERANT_WORKLOAD_PERCENTAGE = 0.30
+
+# Maximum waiting-time scenarios (minutes)
+DEADLINE_SCENARIOS_MINUTES = [15, 30, 60]
+
+# Scheduling interval
+SCHEDULING_INTERVAL_MINUTES = 1
+
+
+# --------------------------------------------------
+# CARBON CONFIGURATION
+# --------------------------------------------------
+
+CARBON_COLUMN = "carbon_intensity_lifecycle"
+
+# Lower carbon intensity is preferred
+CARBON_OPTIMIZATION_ENABLED = True
+
+
+# --------------------------------------------------
+# ENERGY CONFIGURATION
+# --------------------------------------------------
+
+ENERGY_SCENARIO = "capacity_20"
+
+CONCURRENCY_CAPACITY = 20
+
+IDLE_POWER_W = 44.0
+PEAK_POWER_W = 125.0
+
+
+# --------------------------------------------------
+# COST CONFIGURATION
+# --------------------------------------------------
+
+MEMORY_ALLOCATION_MB = 1024
+
+EXECUTION_PRICE_PER_MILLION = 0.20
+PRICE_PER_GB_SECOND = 0.000016
+
+
+# --------------------------------------------------
+# OBJECTIVE FUNCTION WEIGHTS
+# --------------------------------------------------
+
+ENERGY_WEIGHT = 0.30
+CARBON_WEIGHT = 0.50
+COST_WEIGHT = 0.20
+
+
+# --------------------------------------------------
+# OUTPUT SETTINGS
+# --------------------------------------------------
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------
+# VALIDATE REQUIRED INPUT FILES
+# --------------------------------------------------
+
+if not INPUT_FILE.exists():
+    raise FileNotFoundError(
+        f"Aggregated workload-carbon dataset not found: {INPUT_FILE}"
+    )
+
+if not RAW_WORKLOAD_FILE.exists():
+    raise FileNotFoundError(
+        f"Original invocation trace not found: {RAW_WORKLOAD_FILE}"
+    )
+
+
+# --------------------------------------------------
+# CONFIGURATION INFORMATION
+# --------------------------------------------------
+
+print("LOAD BALANCING CONFIGURATION LOADED")
+
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Original workload: {RAW_WORKLOAD_FILE}")
+print(f"Aggregated dataset: {INPUT_FILE}")
+print(f"Output directory: {OUTPUT_DIR}")
+
+print(
+    f"Immediate workload: "
+    f"{IMMEDIATE_WORKLOAD_PERCENTAGE * 100:.0f}%"
+)
+
+print(
+    f"Delay-tolerant workload: "
+    f"{DELAY_TOLERANT_WORKLOAD_PERCENTAGE * 100:.0f}%"
+)
+
+print(f"Deadline scenarios: {DEADLINE_SCENARIOS_MINUTES}")
+
+
+================================================
+FILE: Coding/LoadBalancing/carbon_aware_scheduler.py
+================================================
+
+import numpy as np
+import pandas as pd
+
+from datetime import datetime, timedelta, timezone
+
+from config import (
+    OUTPUT_DIR,
+    INPUT_FILE,
+    DEADLINE_SCENARIOS_MINUTES,
+    CARBON_COLUMN
+)
+
+
+# --------------------------------------------------
+# 1. LOAD CLASSIFIED WORKLOAD
+# --------------------------------------------------
+
+def load_classified_workload():
+
+    input_file = OUTPUT_DIR / "classified_workload.csv"
+
+    print("\nLoading classified workload...")
+
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Classified workload not found: {input_file}"
+        )
+
+    df = pd.read_csv(input_file)
+
+    required_columns = [
+        "app",
+        "func",
+        "end_timestamp",
+        "duration",
+        "start_timestamp",
+        "workload_type"
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+            raise ValueError(
+                f"Missing workload column: {column}"
+            )
+
+    print(f"Loaded invocations: {len(df):,}")
+
+    return df
+
+
+# --------------------------------------------------
+# 2. LOAD HOURLY CARBON DATA
+# --------------------------------------------------
+
+def load_carbon_data():
+
+    print("\nLoading workload-carbon dataset...")
+
+    carbon_df = pd.read_csv(INPUT_FILE)
+
+    required_columns = [
+        "minute",
+        CARBON_COLUMN
+    ]
+
+    for column in required_columns:
+
+        if column not in carbon_df.columns:
+            raise ValueError(
+                f"Missing carbon column: {column}"
+            )
+
+    carbon_df = carbon_df[
+        ["minute", CARBON_COLUMN]
+    ].copy()
+
+    carbon_df["minute"] = pd.to_numeric(
+        carbon_df["minute"],
+        errors="raise"
+    )
+
+    carbon_df[CARBON_COLUMN] = pd.to_numeric(
+        carbon_df[CARBON_COLUMN],
+        errors="raise"
+    )
+
+    if carbon_df.isnull().any().any():
+        raise ValueError(
+            "Missing values in carbon dataset."
+        )
+
+    if carbon_df["minute"].duplicated().any():
+        raise ValueError(
+            "Duplicate minute values in carbon dataset."
+        )
+
+    carbon_df = carbon_df.sort_values("minute")
+
+    expected_minutes = np.arange(len(carbon_df))
+
+    if not np.array_equal(
+        carbon_df["minute"].to_numpy(),
+        expected_minutes
+    ):
+        raise ValueError(
+            "Carbon dataset must contain continuous minute indices "
+            "starting from zero."
+        )
+
+    carbon_values = carbon_df[
+        CARBON_COLUMN
+    ].to_numpy(dtype=float)
+
+    if not np.isfinite(carbon_values).all():
+        raise ValueError(
+            "Invalid carbon-intensity values found."
+        )
+
+    print(f"Carbon records loaded: {len(carbon_df):,}")
+
+    print(
+        f"Mean lifecycle carbon intensity: "
+        f"{carbon_values.mean():.2f} gCO2e/kWh"
+    )
+
+    return carbon_values
+
+
+# --------------------------------------------------
+# 3. CARBON-AWARE SCHEDULING
+# --------------------------------------------------
+
+def schedule_carbon_aware(
+    df,
+    carbon_values,
+    deadline_minutes
+):
+
+    print(
+        f"\nRunning carbon-aware scheduling "
+        f"with {deadline_minutes}-minute deadline..."
+    )
+
+    scheduled = df.copy()
+
+    start_times = scheduled[
+        "start_timestamp"
+    ].to_numpy(dtype=float)
+
+    durations = scheduled[
+        "duration"
+    ].to_numpy(dtype=float)
+
+    workload_types = scheduled[
+        "workload_type"
+    ].to_numpy()
+
+    total_carbon_minutes = len(carbon_values)
+
+    # Convert original start timestamps into minute indices.
+    original_minutes = np.floor(
+        start_times / 60
+    ).astype(np.int64)
+
+    if (
+        (original_minutes < 0).any()
+        or (original_minutes >= total_carbon_minutes).any()
+    ):
+        raise ValueError(
+            "Some invocation timestamps fall outside the "
+            "available carbon-data window."
+        )
+
+    # Carbon intensity at each invocation's original minute.
+    original_carbon = carbon_values[
+        original_minutes
+    ]
+
+    # Default: execute at the original start time.
+    best_start_times = start_times.copy()
+
+    best_carbon = original_carbon.copy()
+
+    # Only delay-tolerant jobs are eligible for rescheduling.
+    tolerant_mask = (
+        workload_types == "DELAY_TOLERANT"
+    )
+
+    # Examine future minute boundaries within the deadline.
+    # Each candidate is compared with the original carbon intensity.
+    for offset in range(1, deadline_minutes + 1):
+
+        candidate_minutes = (
+            original_minutes + offset
+        )
+
+        valid_mask = (
+            tolerant_mask
+            & (candidate_minutes < total_carbon_minutes)
+        )
+
+        candidate_indices = np.flatnonzero(
+            valid_mask
+        )
+
+        if len(candidate_indices) == 0:
+            continue
+
+        candidate_start_times = (
+            candidate_minutes[candidate_indices] * 60.0
+        )
+
+        waiting_times = (
+            candidate_start_times
+            - start_times[candidate_indices]
+        )
+
+        # Enforce the exact deadline, not just minute count.
+        within_deadline = (
+            (waiting_times > 0)
+            & (waiting_times <= deadline_minutes * 60)
+        )
+
+        candidate_indices = candidate_indices[
+            within_deadline
+        ]
+
+        if len(candidate_indices) == 0:
+            continue
+
+        candidate_minutes_valid = candidate_minutes[
+            candidate_indices
+        ]
+
+        candidate_carbon = carbon_values[
+            candidate_minutes_valid
+        ]
+
+        # Update only when carbon intensity is strictly lower.
+        # Since offsets are checked in ascending order,
+        # equal-carbon candidates retain the earlier schedule.
+        improvement_mask = (
+            candidate_carbon
+            < best_carbon[candidate_indices]
+        )
+
+        improved_indices = candidate_indices[
+            improvement_mask
+        ]
+
+        if len(improved_indices) == 0:
+            continue
+
+        best_start_times[improved_indices] = (
+            candidate_minutes[improved_indices] * 60.0
+        )
+
+        best_carbon[improved_indices] = (
+            candidate_carbon[improvement_mask]
+        )
+
+    # Calculate waiting time.
+    waiting_times = (
+        best_start_times - start_times
+    )
+
+    # Create scheduling output.
+    scheduled["original_carbon_intensity"] = (
+        original_carbon
+    )
+
+    scheduled["scheduled_carbon_intensity"] = (
+        best_carbon
+    )
+
+    scheduled["scheduled_start_timestamp"] = (
+        best_start_times
+    )
+
+    scheduled["scheduled_end_timestamp"] = (
+        best_start_times + durations
+    )
+
+    scheduled["waiting_time_seconds"] = (
+        waiting_times
+    )
+
+    scheduled["deadline_minutes"] = (
+        deadline_minutes
+    )
+
+    scheduled["scheduling_strategy"] = (
+        "CARBON_AWARE"
+    )
+
+    # Record whether the invocation was actually delayed.
+    scheduled["was_delayed"] = (
+        waiting_times > 0
+    )
+
+    return scheduled
+
+
+# --------------------------------------------------
+# 4. VALIDATE CARBON-AWARE SCHEDULE
+# --------------------------------------------------
+
+def validate_schedule(
+    original,
+    scheduled,
+    deadline_minutes
+):
+
+    print("\nVALIDATING CARBON-AWARE SCHEDULE")
+    print("================================")
+
+    # Check invocation count.
+    assert len(original) == len(scheduled), (
+        "Invocation count changed."
+    )
+
+    # Immediate jobs must not be delayed.
+    immediate_mask = (
+        scheduled["workload_type"] == "IMMEDIATE"
+    )
+
+    assert (
+        scheduled.loc[
+            immediate_mask,
+            "waiting_time_seconds"
+        ] == 0
+    ).all(), (
+        "Immediate workload was delayed."
+    )
+
+    # Waiting times must be non-negative.
+    assert (
+        scheduled["waiting_time_seconds"] >= 0
+    ).all(), (
+        "Negative waiting time found."
+    )
+
+    # No invocation may exceed its deadline.
+    assert (
+        scheduled["waiting_time_seconds"]
+        <= deadline_minutes * 60 + 1e-9
+    ).all(), (
+        "Deadline violation found."
+    )
+
+    # Execution durations must remain unchanged.
+    calculated_durations = (
+        scheduled["scheduled_end_timestamp"]
+        - scheduled["scheduled_start_timestamp"]
+    )
+
+    assert np.allclose(
+        calculated_durations,
+        scheduled["duration"]
+    ), (
+        "Execution durations changed."
+    )
+
+    # Scheduled carbon must not be higher than original carbon.
+    assert (
+        scheduled["scheduled_carbon_intensity"]
+        <= scheduled["original_carbon_intensity"] + 1e-9
+    ).all(), (
+        "Carbon intensity increased."
+    )
+
+    # Validate category preservation.
+    assert (
+        scheduled["workload_type"].equals(
+            original["workload_type"]
+        )
+    ), (
+        "Workload categories changed."
+    )
+
+    # Validate that original timestamps are preserved.
+    assert np.allclose(
+        scheduled["start_timestamp"],
+        original["start_timestamp"]
+    ), (
+        "Original start timestamps changed."
+    )
+
+    print("PASS: All invocations preserved.")
+    print("PASS: Immediate jobs were not delayed.")
+    print("PASS: Waiting times are non-negative.")
+    print("PASS: All jobs meet their deadlines.")
+    print("PASS: Execution durations preserved.")
+    print("PASS: Carbon intensity did not increase.")
+    print("PASS: Workload categories preserved.")
+    print("PASS: Original timestamps preserved.")
+
+    print("\nAll carbon-aware validation checks passed.")
+
+
+# --------------------------------------------------
+# 5. GENERATE SCHEDULING SUMMARY
+# --------------------------------------------------
+
+def generate_summary(scheduled):
+
+    summary = (
+        scheduled.groupby("workload_type")
+        .agg(
+            invocation_count=("duration", "count"),
+
+            average_duration=("duration", "mean"),
+
+            total_execution_seconds=("duration", "sum"),
+
+            average_waiting_seconds=(
+                "waiting_time_seconds", "mean"
+            ),
+
+            maximum_waiting_seconds=(
+                "waiting_time_seconds", "max"
+            ),
+
+            delayed_invocations=(
+                "was_delayed", "sum"
+            ),
+
+            average_original_carbon=(
+                "original_carbon_intensity", "mean"
+            ),
+
+            average_scheduled_carbon=(
+                "scheduled_carbon_intensity", "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    summary["percentage"] = (
+        summary["invocation_count"]
+        / len(scheduled)
+        * 100
+    )
+
+    return summary
+
+
+# --------------------------------------------------
+# 6. SAVE RESULTS
+# --------------------------------------------------
+
+def save_results(
+    scheduled,
+    summary,
+    deadline_minutes
+):
+
+    output_file = (
+        OUTPUT_DIR
+        / f"carbon_aware_schedule_{deadline_minutes}min.csv"
+    )
+
+    summary_file = (
+        OUTPUT_DIR
+        / f"carbon_aware_summary_{deadline_minutes}min.csv"
+    )
+
+    scheduled.to_csv(
+        output_file,
+        index=False
+    )
+
+    summary.to_csv(
+        summary_file,
+        index=False
+    )
+
+    print("\nRESULTS SAVED")
+
+    print(f"Schedule: {output_file}")
+
+    print(f"Summary: {summary_file}")
+
+
+# --------------------------------------------------
+# 7. MAIN EXECUTION
+# --------------------------------------------------
+
+def main():
+
+    original = load_classified_workload()
+
+    carbon_values = load_carbon_data()
+
+    for deadline in DEADLINE_SCENARIOS_MINUTES:
+
+        scheduled = schedule_carbon_aware(
+            original,
+            carbon_values,
+            deadline
+        )
+
+        validate_schedule(
+            original,
+            scheduled,
+            deadline
+        )
+
+        summary = generate_summary(
+            scheduled
+        )
+
+        print(
+            f"\nCARBON-AWARE SUMMARY: "
+            f"{deadline}-MINUTE DEADLINE"
+        )
+
+        print(
+            summary.to_string(
+                index=False,
+                float_format=lambda value: f"{value:.4f}"
+            )
+        )
+
+        save_results(
+            scheduled,
+            summary,
+            deadline
+        )
+
+        del scheduled
+        del summary
+
+    print("\nALL CARBON-AWARE SCHEDULING SCENARIOS COMPLETED!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: Coding/LoadBalancing/multi_objective_scheduler.py
+================================================
+
+import gc
+import numpy as np
+import pandas as pd
+
+from config import (
+    OUTPUT_DIR,
+    INPUT_FILE,
+    DEADLINE_SCENARIOS_MINUTES,
+    CARBON_COLUMN,
+    CONCURRENCY_CAPACITY,
+    IDLE_POWER_W,
+    PEAK_POWER_W,
+    MEMORY_ALLOCATION_MB,
+    EXECUTION_PRICE_PER_MILLION,
+    PRICE_PER_GB_SECOND,
+    ENERGY_WEIGHT,
+    CARBON_WEIGHT,
+    COST_WEIGHT,
+    INTERVAL_SECONDS
+)
+
+
+# ==========================================================
+# 1. LOAD CLASSIFIED WORKLOAD
+# ==========================================================
+
+def load_classified_workload():
+
+    path = OUTPUT_DIR / "classified_workload.csv"
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Classified workload not found: {path}"
+        )
+
+    print("\nLoading classified workload...")
+
+    df = pd.read_csv(path)
+
+    required_columns = [
+        "app",
+        "func",
+        "end_timestamp",
+        "duration",
+        "start_timestamp",
+        "workload_type"
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+            raise ValueError(
+                f"Missing workload column: {column}"
+            )
+
+    if df.empty:
+        raise ValueError("Workload dataset is empty.")
+
+    numeric_columns = [
+        "end_timestamp",
+        "duration",
+        "start_timestamp"
+    ]
+
+    for column in numeric_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="raise"
+        )
+
+        if not np.isfinite(
+            df[column].to_numpy(dtype=float)
+        ).all():
+
+            raise ValueError(
+                f"Invalid numeric values in {column}."
+            )
+
+    if (df["duration"] < 0).any():
+        raise ValueError("Negative execution duration found.")
+
+    valid_categories = {
+        "IMMEDIATE",
+        "DELAY_TOLERANT"
+    }
+
+    if not set(df["workload_type"].unique()).issubset(
+        valid_categories
+    ):
+        raise ValueError("Invalid workload category.")
+
+    print(f"Total invocations: {len(df):,}")
+
+    return df
+
+
+# ==========================================================
+# 2. LOAD MINUTE-LEVEL DATA
+# ==========================================================
+
+def load_minute_metrics():
+
+    print("\nLoading minute-level energy and carbon data...")
+
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(
+            f"Input dataset not found: {INPUT_FILE}"
+        )
+
+    df = pd.read_csv(INPUT_FILE)
+
+    required_columns = [
+        "minute",
+        "total_execution_seconds",
+        "average_concurrency",
+        "maximum_concurrency",
+        CARBON_COLUMN
+    ]
+
+    for column in required_columns:
+
+        if column not in df.columns:
+            raise ValueError(
+                f"Missing input column: {column}"
+            )
+
+    df = df[required_columns].copy()
+
+    for column in required_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="raise"
+        )
+
+    df = df.sort_values(
+        "minute"
+    ).reset_index(drop=True)
+
+    if df.isnull().any().any():
+        raise ValueError(
+            "Missing values found in minute-level dataset."
+        )
+
+    expected_minutes = np.arange(len(df))
+
+    if not np.array_equal(
+        df["minute"].to_numpy(),
+        expected_minutes
+    ):
+        raise ValueError(
+            "Minute indices must be continuous and start at zero."
+        )
+
+    numeric_values = df[
+        required_columns
+    ].to_numpy(dtype=float)
+
+    if not np.isfinite(numeric_values).all():
+        raise ValueError(
+            "Non-finite values found in minute-level dataset."
+        )
+
+    if (
+        (df["total_execution_seconds"] < 0).any()
+        or (df["average_concurrency"] < 0).any()
+        or (df["maximum_concurrency"] < 0).any()
+        or (df[CARBON_COLUMN] < 0).any()
+    ):
+        raise ValueError(
+            "Negative workload or carbon values found."
+        )
+
+    print(f"Minute records: {len(df):,}")
+
+    return df
+
+
+# ==========================================================
+# 3. NORMALIZATION
+# ==========================================================
+
+def min_max_normalize(values):
+
+    values = np.asarray(
+        values,
+        dtype=float
+    )
+
+    finite_mask = np.isfinite(values)
+
+    if not finite_mask.any():
+        raise ValueError(
+            "No finite values available for normalization."
+        )
+
+    minimum = np.min(
+        values[finite_mask]
+    )
+
+    maximum = np.max(
+        values[finite_mask]
+    )
+
+    result = np.zeros_like(
+        values,
+        dtype=float
+    )
+
+    if maximum == minimum:
+
+        result[finite_mask] = 0.0
+
+    else:
+
+        result[finite_mask] = (
+            values[finite_mask] - minimum
+        ) / (maximum - minimum)
+
+    # Undefined values receive a neutral normalized score.
+    result[~finite_mask] = 0.5
+
+    return result
+
+
+# ==========================================================
+# 4. ESTIMATE MINUTE-LEVEL ENERGY
+# ==========================================================
+
+def calculate_minute_energy_metrics(minute_df):
+
+    print("\nEstimating minute-level energy...")
+
+    average_concurrency = minute_df[
+        "average_concurrency"
+    ].to_numpy(dtype=float)
+
+    maximum_concurrency = minute_df[
+        "maximum_concurrency"
+    ].to_numpy(dtype=float)
+
+    execution_seconds = minute_df[
+        "total_execution_seconds"
+    ].to_numpy(dtype=float)
+
+    # Estimate required instances.
+    instance_count = np.ceil(
+        maximum_concurrency / CONCURRENCY_CAPACITY
+    ).astype(int)
+
+    # Calculate total concurrency capacity.
+    total_capacity = (
+        instance_count * CONCURRENCY_CAPACITY
+    )
+
+    # Estimate utilization.
+    utilization = np.divide(
+        average_concurrency,
+        total_capacity,
+        out=np.zeros_like(average_concurrency),
+        where=total_capacity > 0
+    )
+
+    utilization = np.clip(
+        utilization,
+        0,
+        1
+    )
+
+    # Estimate power consumption.
+    power_w = np.where(
+        instance_count > 0,
+
+        instance_count * (
+            IDLE_POWER_W
+            + utilization * (
+                PEAK_POWER_W - IDLE_POWER_W
+            )
+        ),
+
+        0.0
+    )
+
+    # Energy consumed during one minute.
+    energy_kwh = (
+        power_w
+        * INTERVAL_SECONDS
+        / 3_600_000
+    )
+
+    # Energy per execution second.
+    energy_intensity = np.divide(
+        energy_kwh,
+        execution_seconds,
+        out=np.full_like(
+            energy_kwh,
+            np.nan
+        ),
+        where=execution_seconds > 0
+    )
+
+    # ------------------------------------------------------
+    # FIX: HANDLE UNDEFINED ENERGY INTENSITY
+    # ------------------------------------------------------
+
+    valid_energy = (
+        np.isfinite(energy_intensity)
+        & (energy_intensity >= 0)
+    )
+
+    if not valid_energy.any():
+        raise ValueError(
+            "No valid energy-intensity values available."
+        )
+
+    median_energy_intensity = np.median(
+        energy_intensity[valid_energy]
+    )
+
+    undefined_count = (
+        ~valid_energy
+    ).sum()
+
+    energy_intensity[~valid_energy] = (
+        median_energy_intensity
+    )
+
+    print(
+        f"Valid energy-intensity minutes: "
+        f"{valid_energy.sum():,}"
+    )
+
+    print(
+        f"Undefined energy-intensity minutes: "
+        f"{undefined_count:,}"
+    )
+
+    print(
+        f"Median energy-intensity fallback: "
+        f"{median_energy_intensity:.10f} kWh/sec"
+    )
+
+    minute_df["estimated_instances"] = (
+        instance_count
+    )
+
+    minute_df["estimated_power_w"] = (
+        power_w
+    )
+
+    minute_df["estimated_energy_kwh"] = (
+        energy_kwh
+    )
+
+    minute_df["energy_per_execution_second"] = (
+        energy_intensity
+    )
+
+    if not np.isfinite(
+        minute_df[
+            "energy_per_execution_second"
+        ].to_numpy(dtype=float)
+    ).all():
+
+        raise ValueError(
+            "Energy-intensity calculation still contains "
+            "non-finite values."
+        )
+
+    print(
+        "PASS: Minute-level energy metrics calculated."
+    )
+
+    return minute_df
+
+
+# ==========================================================
+# 5. CALCULATE INVOCATION COST
+# ==========================================================
+
+def calculate_invocation_cost(durations):
+
+    # Minimum billable execution duration.
+    billable_duration = np.maximum(
+        durations,
+        0.100
+    )
+
+    # Round upward to nearest millisecond.
+    billable_duration = (
+        np.ceil(
+            billable_duration * 1000
+        ) / 1000
+    )
+
+    # Round memory to nearest 128 MB.
+    billable_memory_mb = (
+        np.ceil(
+            MEMORY_ALLOCATION_MB / 128
+        ) * 128
+    )
+
+    billable_memory_mb = min(
+        billable_memory_mb,
+        1536
+    )
+
+    # Calculate GB-seconds.
+    gb_seconds = (
+        billable_memory_mb / 1024
+    ) * billable_duration
+
+    # Execution charge.
+    execution_cost = (
+        EXECUTION_PRICE_PER_MILLION
+        / 1_000_000
+    )
+
+    # Resource charge.
+    resource_cost = (
+        gb_seconds * PRICE_PER_GB_SECOND
+    )
+
+    total_cost = (
+        execution_cost + resource_cost
+    )
+
+    return total_cost
+
+
+# ==========================================================
+# 6. CALCULATE OBJECTIVE SCORES
+# ==========================================================
+
+def calculate_objective_scores(
+    energy_values,
+    carbon_values,
+    cost_values
+):
+
+    energy_normalized = min_max_normalize(
+        energy_values
+    )
+
+    carbon_normalized = min_max_normalize(
+        carbon_values
+    )
+
+    cost_normalized = min_max_normalize(
+        cost_values
+    )
+
+    score = (
+        ENERGY_WEIGHT * energy_normalized
+        + CARBON_WEIGHT * carbon_normalized
+        + COST_WEIGHT * cost_normalized
+    )
+
+    return (
+        score,
+        energy_normalized,
+        carbon_normalized,
+        cost_normalized
+    )
+
+
+# ==========================================================
+# 7. MULTI-OBJECTIVE SCHEDULER
+# ==========================================================
+
+def run_multi_objective_scheduler(
+    workload,
+    minute_metrics,
+    deadline_minutes
+):
+
+    print(
+        f"\nRunning multi-objective scheduling: "
+        f"{deadline_minutes}-minute deadline"
+    )
+
+    start_times = workload[
+        "start_timestamp"
+    ].to_numpy(dtype=float)
+
+    durations = workload[
+        "duration"
+    ].to_numpy(dtype=float)
+
+    workload_types = workload[
+        "workload_type"
+    ].to_numpy()
+
+    carbon = minute_metrics[
+        CARBON_COLUMN
+    ].to_numpy(dtype=float)
+
+    energy_intensity = minute_metrics[
+        "energy_per_execution_second"
+    ].to_numpy(dtype=float)
+
+    number_of_minutes = len(minute_metrics)
+
+    # Convert original start times to minute indices.
+    original_minutes = np.floor(
+        start_times / 60
+    ).astype(np.int64)
+
+    if (
+        (original_minutes < 0).any()
+        or (original_minutes >= number_of_minutes).any()
+    ):
+        raise ValueError(
+            "Invocation falls outside available timeline."
+        )
+
+    # Calculate invocation-level cost.
+    invocation_cost = calculate_invocation_cost(
+        durations
+    )
+
+    # Normalize energy and carbon across candidate minutes.
+    energy_normalized = min_max_normalize(
+        energy_intensity
+    )
+
+    carbon_normalized = min_max_normalize(
+        carbon
+    )
+
+    # Cost is invocation-specific and time-independent.
+    cost_normalized = min_max_normalize(
+        invocation_cost
+    )
+
+    # Original objective components.
+    original_energy = energy_intensity[
+        original_minutes
+    ]
+
+    original_carbon = carbon[
+        original_minutes
+    ]
+
+    original_energy_norm = energy_normalized[
+        original_minutes
+    ]
+
+    original_carbon_norm = carbon_normalized[
+        original_minutes
+    ]
+
+    original_cost_norm = cost_normalized
+
+    original_score = (
+        ENERGY_WEIGHT * original_energy_norm
+        + CARBON_WEIGHT * original_carbon_norm
+        + COST_WEIGHT * original_cost_norm
+    )
+
+    # Initially, every invocation executes at its original time.
+    best_start = start_times.copy()
+
+    best_energy = original_energy.copy()
+
+    best_carbon = original_carbon.copy()
+
+    best_score = original_score.copy()
+
+    # Only delay-tolerant workload can be rescheduled.
+    tolerant_mask = (
+        workload_types == "DELAY_TOLERANT"
+    )
+
+    # ------------------------------------------------------
+    # Examine all eligible future minute boundaries.
+    # ------------------------------------------------------
+
+    for offset in range(
+        1,
+        deadline_minutes + 1
+    ):
+
+        candidate_minutes = (
+            original_minutes + offset
+        )
+
+        valid_mask = (
+            tolerant_mask
+            & (candidate_minutes < number_of_minutes)
+        )
+
+        candidate_indices = np.flatnonzero(
+            valid_mask
+        )
+
+        if len(candidate_indices) == 0:
+            continue
+
+        candidate_start = (
+            candidate_minutes[candidate_indices] * 60.0
+        )
+
+        waiting_times = (
+            candidate_start
+            - start_times[candidate_indices]
+        )
+
+        within_deadline = (
+            (waiting_times > 0)
+            & (
+                waiting_times
+                <= deadline_minutes * 60 + 1e-9
+            )
+        )
+
+        candidate_indices = candidate_indices[
+            within_deadline
+        ]
+
+        if len(candidate_indices) == 0:
+            continue
+
+        selected_minutes = candidate_minutes[
+            candidate_indices
+        ]
+
+        candidate_energy_norm = (
+            energy_normalized[selected_minutes]
+        )
+
+        candidate_carbon_norm = (
+            carbon_normalized[selected_minutes]
+        )
+
+        candidate_cost_norm = (
+            cost_normalized[candidate_indices]
+        )
+
+        candidate_energy = (
+            energy_intensity[selected_minutes]
+        )
+
+        candidate_carbon = (
+            carbon[selected_minutes]
+        )
+
+        candidate_score = (
+            ENERGY_WEIGHT * candidate_energy_norm
+            + CARBON_WEIGHT * candidate_carbon_norm
+            + COST_WEIGHT * candidate_cost_norm
+        )
+
+        # Select only if the combined score improves.
+        improvement = (
+            candidate_score
+            < best_score[candidate_indices] - 1e-12
+        )
+
+        improved_indices = candidate_indices[
+            improvement
+        ]
+
+        if len(improved_indices) == 0:
+            continue
+
+        best_score[improved_indices] = (
+            candidate_score[improvement]
+        )
+
+        best_start[improved_indices] = (
+            selected_minutes[improvement] * 60.0
+        )
+
+        best_energy[improved_indices] = (
+            candidate_energy[improvement]
+        )
+
+        best_carbon[improved_indices] = (
+            candidate_carbon[improvement]
+        )
+
+    # ------------------------------------------------------
+    # Prepare output
+    # ------------------------------------------------------
+
+    result = workload.copy()
+
+    result["original_carbon_intensity"] = (
+        original_carbon
+    )
+
+    result["scheduled_carbon_intensity"] = (
+        best_carbon
+    )
+
+    result["original_energy_intensity"] = (
+        original_energy
+    )
+
+    result["scheduled_energy_intensity"] = (
+        best_energy
+    )
+
+    result["estimated_cost_usd"] = (
+        invocation_cost
+    )
+
+    result["scheduled_start_timestamp"] = (
+        best_start
+    )
+
+    result["scheduled_end_timestamp"] = (
+        best_start + durations
+    )
+
+    result["waiting_time_seconds"] = (
+        best_start - start_times
+    )
+
+    result["was_delayed"] = (
+        result["waiting_time_seconds"] > 0
+    )
+
+    result["original_objective_score"] = (
+        original_score
+    )
+
+    result["scheduled_objective_score"] = (
+        best_score
+    )
+
+    result["deadline_minutes"] = (
+        deadline_minutes
+    )
+
+    result["scheduling_strategy"] = (
+        "MULTI_OBJECTIVE"
+    )
+
+    print(
+        f"Scheduled invocations: {len(result):,}"
+    )
+
+    return result
+
+
+# ==========================================================
+# 8. VALIDATE SCHEDULE
+# ==========================================================
+
+def validate_schedule(
+    original,
+    scheduled,
+    deadline_minutes
+):
+
+    print(
+        "\nVALIDATING MULTI-OBJECTIVE SCHEDULE"
+    )
+
+    print(
+        "==================================="
+    )
+
+    checks = {}
+
+    checks["Invocation count preserved"] = (
+        len(original) == len(scheduled)
+    )
+
+    checks["Original timestamps preserved"] = (
+        np.allclose(
+            scheduled["start_timestamp"],
+            original["start_timestamp"]
+        )
+    )
+
+    checks["Waiting times non-negative"] = (
+        scheduled["waiting_time_seconds"] >= 0
+    ).all()
+
+    checks["Deadline compliance"] = (
+        scheduled["waiting_time_seconds"]
+        <= deadline_minutes * 60 + 1e-9
+    ).all()
+
+    immediate_mask = (
+        scheduled["workload_type"] == "IMMEDIATE"
+    )
+
+    checks["Immediate jobs not delayed"] = (
+        scheduled.loc[
+            immediate_mask,
+            "waiting_time_seconds"
+        ] == 0
+    ).all()
+
+    calculated_duration = (
+        scheduled["scheduled_end_timestamp"]
+        - scheduled["scheduled_start_timestamp"]
+    )
+
+    checks["Execution durations preserved"] = (
+        np.allclose(
+            calculated_duration,
+            scheduled["duration"]
+        )
+    )
+
+    checks["Objective score did not increase"] = (
+        scheduled["scheduled_objective_score"]
+        <= scheduled["original_objective_score"] + 1e-9
+    ).all()
+
+    checks["Estimated costs are valid"] = (
+        np.isfinite(
+            scheduled["estimated_cost_usd"]
+        ).all()
+        and
+        (scheduled["estimated_cost_usd"] >= 0).all()
+    )
+
+    checks["Carbon values are valid"] = (
+        np.isfinite(
+            scheduled["scheduled_carbon_intensity"]
+        ).all()
+        and
+        (scheduled["scheduled_carbon_intensity"] >= 0).all()
+    )
+
+    checks["Energy values are valid"] = (
+        np.isfinite(
+            scheduled["scheduled_energy_intensity"]
+        ).all()
+        and
+        (scheduled["scheduled_energy_intensity"] >= 0).all()
+    )
+
+    checks["Objective scores are finite"] = (
+        np.isfinite(
+            scheduled["scheduled_objective_score"]
+        ).all()
+        and
+        np.isfinite(
+            scheduled["original_objective_score"]
+        ).all()
+    )
+
+    checks["Workload categories preserved"] = (
+        scheduled["workload_type"].equals(
+            original["workload_type"]
+        )
+    )
+
+    failed_checks = []
+
+    for name, passed in checks.items():
+
+        if passed:
+
+            print(f"PASS: {name}")
+
+        else:
+
+            print(f"FAIL: {name}")
+
+            failed_checks.append(name)
+
+    if failed_checks:
+
+        raise AssertionError(
+            "Validation failed: "
+            + ", ".join(failed_checks)
+        )
+
+    print(
+        "\nAll multi-objective validation checks passed."
+    )
+
+
+# ==========================================================
+# 9. GENERATE SUMMARY
+# ==========================================================
+
+def generate_summary(scheduled):
+
+    summary = (
+        scheduled.groupby("workload_type")
+        .agg(
+
+            invocation_count=(
+                "duration",
+                "count"
+            ),
+
+            delayed_invocations=(
+                "was_delayed",
+                "sum"
+            ),
+
+            average_waiting_seconds=(
+                "waiting_time_seconds",
+                "mean"
+            ),
+
+            maximum_waiting_seconds=(
+                "waiting_time_seconds",
+                "max"
+            ),
+
+            average_original_carbon=(
+                "original_carbon_intensity",
+                "mean"
+            ),
+
+            average_scheduled_carbon=(
+                "scheduled_carbon_intensity",
+                "mean"
+            ),
+
+            average_original_energy_intensity=(
+                "original_energy_intensity",
+                "mean"
+            ),
+
+            average_scheduled_energy_intensity=(
+                "scheduled_energy_intensity",
+                "mean"
+            ),
+
+            total_estimated_cost_usd=(
+                "estimated_cost_usd",
+                "sum"
+            ),
+
+            average_original_objective=(
+                "original_objective_score",
+                "mean"
+            ),
+
+            average_scheduled_objective=(
+                "scheduled_objective_score",
+                "mean"
+            )
+        )
+        .reset_index()
+    )
+
+    summary["percentage"] = (
+        summary["invocation_count"]
+        / len(scheduled)
+        * 100
+    )
+
+    summary["delayed_percentage"] = (
+        summary["delayed_invocations"]
+        / summary["invocation_count"]
+        * 100
+    )
+
+    return summary
+
+
+# ==========================================================
+# 10. SAVE RESULTS
+# ==========================================================
+
+def save_results(
+    scheduled,
+    summary,
+    deadline_minutes
+):
+
+    output_file = (
+        OUTPUT_DIR
+        / f"multi_objective_schedule_{deadline_minutes}min.csv"
+    )
+
+    summary_file = (
+        OUTPUT_DIR
+        / f"multi_objective_summary_{deadline_minutes}min.csv"
+    )
+
+    scheduled.to_csv(
+        output_file,
+        index=False
+    )
+
+    summary.to_csv(
+        summary_file,
+        index=False
+    )
+
+    print("\nRESULTS SAVED")
+
+    print(
+        f"Schedule: {output_file}"
+    )
+
+    print(
+        f"Summary: {summary_file}"
+    )
+
+
+# ==========================================================
+# 11. MAIN EXECUTION
+# ==========================================================
+
+def main():
+
+    # Validate objective weights.
+    weights = np.array(
+        [
+            ENERGY_WEIGHT,
+            CARBON_WEIGHT,
+            COST_WEIGHT
+        ],
+        dtype=float
+    )
+
+    if (
+        (weights < 0).any()
+        or not np.isclose(weights.sum(), 1.0)
+    ):
+        raise ValueError(
+            "Objective weights must be non-negative "
+            "and sum to 1."
+        )
+
+    print(
+        "\nMULTI-OBJECTIVE SCHEDULER"
+    )
+
+    print(
+        "========================="
+    )
+
+    print(
+        f"Energy weight: {ENERGY_WEIGHT:.2f}"
+    )
+
+    print(
+        f"Carbon weight: {CARBON_WEIGHT:.2f}"
+    )
+
+    print(
+        f"Cost weight: {COST_WEIGHT:.2f}"
+    )
+
+    print(
+        "\nNOTE: Azure Consumption execution cost is "
+        "time-independent in the current model."
+    )
+
+    workload = load_classified_workload()
+
+    minute_metrics = load_minute_metrics()
+
+    minute_metrics = calculate_minute_energy_metrics(
+        minute_metrics
+    )
+
+    for deadline in DEADLINE_SCENARIOS_MINUTES:
+
+        scheduled = run_multi_objective_scheduler(
+            workload,
+            minute_metrics,
+            deadline
+        )
+
+        validate_schedule(
+            workload,
+            scheduled,
+            deadline
+        )
+
+        summary = generate_summary(
+            scheduled
+        )
+
+        print(
+            f"\nMULTI-OBJECTIVE SUMMARY: "
+            f"{deadline}-MINUTE DEADLINE"
+        )
+
+        print(
+            summary.to_string(
+                index=False,
+                float_format=lambda value: f"{value:.6f}"
+            )
+        )
+
+        save_results(
+            scheduled,
+            summary,
+            deadline
+        )
+
+        del scheduled
+        del summary
+
+        gc.collect()
+
+    print(
+        "\nALL MULTI-OBJECTIVE SCENARIOS COMPLETED!"
+    )
+
+
+if __name__ == "__main__":
+
+    main()
+
+
+================================================
+FILE: Coding/LoadBalancing/exact_capacity_scheduler.py
+================================================
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parents[2]
+
+INPUT_FILE = (
+    ROOT / "Coding" / "LoadBalancing"
+    / "results" / "classified_workload.csv"
+)
+
+CARBON_FILE = (
+    ROOT / "Coding" / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = (
+    ROOT / "Coding" / "LoadBalancing"
+    / "results" / "exact_capacity"
+)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEADLINES = [15, 30, 60]
+
+MAX_CONCURRENCY = 3027
+SLOT_SECONDS = 1
+
+
+# ============================================================
+# RANGE MAX / RANGE ADD SEGMENT TREE
+# ============================================================
+
+class CapacityTree:
+
+    def __init__(self, size):
+
+        self.n = size
+
+        self.maximum = np.zeros(
+            4 * size, dtype=np.int32
+        )
+
+        self.lazy = np.zeros(
+            4 * size, dtype=np.int32
+        )
+
+    def push(self, node):
+
+        value = self.lazy[node]
+
+        if value != 0:
+
+            left = node * 2
+            right = left + 1
+
+            self.maximum[left] += value
+            self.maximum[right] += value
+
+            self.lazy[left] += value
+            self.lazy[right] += value
+
+            self.lazy[node] = 0
+
+    def add(self, ql, qr, value):
+
+        if ql >= qr:
+            return
+
+        self._add(
+            1, 0, self.n, ql, qr, value
+        )
+
+    def _add(self, node, left, right, ql, qr, value):
+
+        if ql <= left and right <= qr:
+
+            self.maximum[node] += value
+            self.lazy[node] += value
+            return
+
+        self.push(node)
+
+        mid = (left + right) // 2
+
+        if ql < mid:
+            self._add(
+                node * 2, left, mid,
+                ql, qr, value
+            )
+
+        if qr > mid:
+            self._add(
+                node * 2 + 1, mid, right,
+                ql, qr, value
+            )
+
+        self.maximum[node] = max(
+            self.maximum[node * 2],
+            self.maximum[node * 2 + 1]
+        )
+
+    def query_max(self, ql, qr):
+
+        if ql >= qr:
+            return 0
+
+        return self._query(
+            1, 0, self.n, ql, qr
+        )
+
+    def _query(self, node, left, right, ql, qr):
+
+        if ql <= left and right <= qr:
+            return int(self.maximum[node])
+
+        self.push(node)
+
+        mid = (left + right) // 2
+        result = 0
+
+        if ql < mid:
+            result = max(
+                result,
+                self._query(
+                    node * 2, left, mid,
+                    ql, qr
+                )
+            )
+
+        if qr > mid:
+            result = max(
+                result,
+                self._query(
+                    node * 2 + 1, mid, right,
+                    ql, qr
+                )
+            )
+
+        return result
+
+    @property
+    def peak(self):
+        return int(self.maximum[1])
+
+
+# ============================================================
+# TIME SLOT CONVERSION
+# ============================================================
+
+def occupied_slots(start, duration):
+
+    if duration <= 0:
+        return None
+
+    first = math.floor(start / SLOT_SECONDS)
+
+    end = start + duration
+
+    last_exclusive = math.ceil(
+        end / SLOT_SECONDS
+    )
+
+    return first, last_exclusive
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_data():
+
+    jobs = pd.read_csv(INPUT_FILE)
+    carbon = pd.read_csv(CARBON_FILE)
+
+    required = [
+        "start_timestamp",
+        "duration",
+        "workload_type"
+    ]
+
+    for col in required:
+        if col not in jobs.columns:
+            raise ValueError(
+                f"Missing column: {col}"
+            )
+
+    if "minute" not in carbon.columns:
+        raise ValueError("Missing carbon minute column.")
+
+    if "carbon_intensity_lifecycle" not in carbon.columns:
+        raise ValueError(
+            "Missing carbon intensity column."
+        )
+
+    jobs["start_timestamp"] = pd.to_numeric(
+        jobs["start_timestamp"], errors="coerce"
+    )
+
+    jobs["duration"] = pd.to_numeric(
+        jobs["duration"], errors="coerce"
+    )
+
+    if jobs[
+        ["start_timestamp", "duration"]
+    ].isna().any().any():
+
+        raise ValueError("Invalid job timestamps or durations.")
+
+    if (
+        (jobs["start_timestamp"] < 0).any()
+        or (jobs["duration"] < 0).any()
+    ):
+        raise ValueError("Negative timestamps or durations found.")
+
+    jobs["workload_type"] = (
+        jobs["workload_type"]
+        .astype(str)
+        .str.upper()
+    )
+
+    valid_types = {
+        "IMMEDIATE",
+        "DELAY_TOLERANT"
+    }
+
+    if not set(jobs["workload_type"].unique()).issubset(valid_types):
+        raise ValueError("Unexpected workload types.")
+
+    carbon = carbon.sort_values(
+        "minute"
+    ).reset_index(drop=True)
+
+    minutes = carbon["minute"].to_numpy(dtype=int)
+
+    if not np.array_equal(
+        minutes,
+        np.arange(len(minutes))
+    ):
+        raise ValueError(
+            "Carbon timeline must be continuous from minute zero."
+        )
+
+    carbon_values = carbon[
+        "carbon_intensity_lifecycle"
+    ].to_numpy(dtype=float)
+
+    if not np.isfinite(carbon_values).all():
+        raise ValueError("Invalid carbon intensity values.")
+
+    if (jobs["start_timestamp"] >= len(carbon_values) * 60).any():
+        raise ValueError(
+            "Some job start timestamps are outside the carbon timeline."
+        )
+
+    return jobs, carbon_values
+
+
+# ============================================================
+# INITIALISE CAPACITY TREE
+# ============================================================
+
+def create_capacity_tree(jobs):
+
+    latest_end = (
+        jobs["start_timestamp"] + jobs["duration"]
+    ).max()
+
+    tree_size = max(
+        1,
+        math.ceil(latest_end / SLOT_SECONDS) + 1
+    )
+
+    tree = CapacityTree(tree_size)
+
+    immediate = jobs[
+        jobs["workload_type"] == "IMMEDIATE"
+    ]
+
+    print(
+        f"Loading {len(immediate):,} immediate invocations..."
+    )
+
+    for start, duration in zip(
+        immediate["start_timestamp"].to_numpy(),
+        immediate["duration"].to_numpy()
+    ):
+
+        slots = occupied_slots(
+            float(start), float(duration)
+        )
+
+        if slots is None:
+            continue
+
+        left, right = slots
+
+        tree.add(left, right, 1)
+
+    if tree.peak > MAX_CONCURRENCY:
+
+        raise RuntimeError(
+            "Immediate workload alone exceeds the experimental "
+            f"capacity ceiling: {tree.peak} > {MAX_CONCURRENCY}. "
+            "The one-second conservative model is infeasible "
+            "with this ceiling."
+        )
+
+    print(
+        f"Immediate workload peak: {tree.peak:,}"
+    )
+
+    return tree
+
+
+# ============================================================
+# SCHEDULE DELAY-TOLERANT JOBS
+# ============================================================
+
+def run_scheduler(jobs, carbon_values, deadline):
+
+    tree = create_capacity_tree(jobs)
+
+    result = jobs.copy()
+
+    original = result[
+        "start_timestamp"
+    ].to_numpy(dtype=float)
+
+    durations = result[
+        "duration"
+    ].to_numpy(dtype=float)
+
+    categories = result[
+        "workload_type"
+    ].to_numpy()
+
+    scheduled = original.copy()
+
+    original_minutes = np.floor(
+        original / 60
+    ).astype(int)
+
+    scheduled_minutes = original_minutes.copy()
+
+    original_carbon = carbon_values[
+        original_minutes
+    ]
+
+    scheduled_carbon = original_carbon.copy()
+
+    waiting = np.zeros(len(result), dtype=float)
+
+    tolerant_indices = np.flatnonzero(
+        categories == "DELAY_TOLERANT"
+    )
+
+    # Process by original arrival time.
+    tolerant_indices = tolerant_indices[
+        np.argsort(
+            original[tolerant_indices],
+            kind="stable"
+        )
+    ]
+
+    delayed_count = 0
+
+    print(
+        f"Scheduling {len(tolerant_indices):,} "
+        "delay-tolerant invocations..."
+    )
+
+    for position, idx in enumerate(tolerant_indices):
+
+        start = original[idx]
+        duration = durations[idx]
+
+        original_minute = original_minutes[idx]
+
+        original_offset = start % 60
+
+        last_candidate = min(
+            original_minute + deadline,
+            len(carbon_values) - 1
+        )
+
+        candidates = np.arange(
+            original_minute,
+            last_candidate + 1
+        )
+
+        # Candidate minutes ordered by carbon intensity.
+        order = np.lexsort(
+            (
+                candidates,
+                carbon_values[candidates]
+            )
+        )
+
+        candidates = candidates[order]
+
+        selected_minute = None
+        selected_start = None
+
+        for candidate in candidates:
+
+            candidate = int(candidate)
+
+            # Do not choose a higher-carbon period.
+            if (
+                carbon_values[candidate]
+                > original_carbon[idx]
+            ):
+                continue
+
+            candidate_start = (
+                candidate * 60 + original_offset
+            )
+
+            wait = candidate_start - start
+
+            if wait < 0 or wait > deadline * 60:
+                continue
+
+            slots = occupied_slots(
+                candidate_start, duration
+            )
+
+            if slots is None:
+
+                selected_minute = candidate
+                selected_start = candidate_start
+                break
+
+            left, right = slots
+
+            peak = tree.query_max(left, right)
+
+            if peak < MAX_CONCURRENCY:
+
+                selected_minute = candidate
+                selected_start = candidate_start
+
+                tree.add(left, right, 1)
+
+                break
+
+        if selected_minute is None:
+
+            raise RuntimeError(
+                f"No capacity-feasible slot found for job {idx}. "
+                "Try increasing the deadline or reviewing "
+                "the experimental capacity ceiling."
+            )
+
+        scheduled[idx] = selected_start
+        scheduled_minutes[idx] = selected_minute
+
+        waiting[idx] = selected_start - start
+
+        scheduled_carbon[idx] = (
+            carbon_values[selected_minute]
+        )
+
+        if waiting[idx] > 0:
+            delayed_count += 1
+
+        if (position + 1) % 100000 == 0:
+
+            print(
+                f"Processed {position + 1:,} / "
+                f"{len(tolerant_indices):,} jobs"
+            )
+
+    result["original_start_timestamp"] = original
+    result["scheduled_start_timestamp"] = scheduled
+    result["scheduled_end_timestamp"] = scheduled + durations
+
+    result["original_minute"] = original_minutes
+    result["scheduled_minute"] = scheduled_minutes
+
+    result["waiting_time_seconds"] = waiting
+
+    result["original_carbon_intensity"] = original_carbon
+    result["scheduled_carbon_intensity"] = scheduled_carbon
+
+    result["scheduling_strategy"] = (
+        f"EXACT_CAPACITY_{deadline}MIN"
+    )
+
+    summary = {
+        "deadline_minutes": deadline,
+        "total_invocations": len(result),
+        "immediate_invocations": int(
+            np.sum(categories == "IMMEDIATE")
+        ),
+        "delay_tolerant_invocations": len(tolerant_indices),
+        "delayed_invocations": delayed_count,
+        "delayed_percentage": (
+            delayed_count / max(len(tolerant_indices), 1) * 100
+        ),
+        "average_waiting_seconds": (
+            waiting[tolerant_indices].mean()
+        ),
+        "maximum_waiting_seconds": waiting.max(),
+        "average_original_carbon_intensity": (
+            original_carbon.mean()
+        ),
+        "average_scheduled_carbon_intensity": (
+            scheduled_carbon.mean()
+        ),
+        "maximum_one_second_slot_concurrency": tree.peak,
+        "capacity_limit": MAX_CONCURRENCY,
+        "time_slot_seconds": SLOT_SECONDS
+    }
+
+    return result, summary
+
+
+# ============================================================
+# VALIDATE
+# ============================================================
+
+def validate(result, deadline):
+
+    immediate = result[
+        result["workload_type"] == "IMMEDIATE"
+    ]
+
+    assert (
+        result["scheduled_start_timestamp"]
+        >= result["original_start_timestamp"]
+    ).all()
+
+    assert (
+        result["waiting_time_seconds"]
+        <= deadline * 60 + 1e-8
+    ).all()
+
+    assert np.allclose(
+        result["scheduled_end_timestamp"],
+        result["scheduled_start_timestamp"]
+        + result["duration"]
+    )
+
+    assert np.allclose(
+        immediate["scheduled_start_timestamp"],
+        immediate["original_start_timestamp"]
+    )
+
+    assert (
+        result["scheduled_carbon_intensity"]
+        <= result["original_carbon_intensity"] + 1e-9
+    ).all()
+
+    print("PASS: Deadline, carbon and immediate-job checks.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("\nINTERVAL-BASED CAPACITY-CONSTRAINED SCHEDULER")
+    print("=" * 60)
+
+    jobs, carbon_values = load_data()
+
+    print(f"Total invocations: {len(jobs):,}")
+    print(f"Capacity ceiling: {MAX_CONCURRENCY:,}")
+    print(f"Time resolution: {SLOT_SECONDS} second")
+
+    summaries = []
+
+    for deadline in DEADLINES:
+
+        print(f"\nRUNNING {deadline}-MINUTE SCENARIO")
+        print("-" * 50)
+
+        result, summary = run_scheduler(
+            jobs,
+            carbon_values,
+            deadline
+        )
+
+        validate(result, deadline)
+
+        output_file = (
+            OUTPUT_DIR
+            / f"exact_capacity_schedule_{deadline}min.csv"
+        )
+
+        result.to_csv(
+            output_file,
+            index=False
+        )
+
+        summaries.append(summary)
+
+        print(
+            f"Delayed jobs: {summary['delayed_invocations']:,}"
+        )
+
+        print(
+            f"Average waiting: "
+            f"{summary['average_waiting_seconds']:.2f} seconds"
+        )
+
+        print(
+            f"Average carbon intensity: "
+            f"{summary['average_original_carbon_intensity']:.2f}"
+            " -> "
+            f"{summary['average_scheduled_carbon_intensity']:.2f}"
+        )
+
+        print(
+            f"Maximum one-second slot concurrency: "
+            f"{summary['maximum_one_second_slot_concurrency']:,}"
+        )
+
+        print(f"Saved: {output_file}")
+
+        del result
+
+    summary_df = pd.DataFrame(summaries)
+
+    summary_file = (
+        OUTPUT_DIR / "exact_capacity_summary.csv"
+    )
+
+    summary_df.to_csv(
+        summary_file,
+        index=False
+    )
+
+    print("\nALL SCENARIOS COMPLETED")
+    print("=" * 60)
+
+    print(summary_df.to_string(index=False))
+    print(f"\nSaved: {summary_file}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: Coding/LoadBalancing/forecast_assisted_scheduler.py
+================================================
+
+from pathlib import Path
+import math
+
+import numpy as np
+import pandas as pd
+
+
+# =========================================================
+# 1. PATHS AND CONFIGURATION
+# =========================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+CLASSIFIED_FILE = (
+    PROJECT_ROOT
+    / "Coding"
+    / "LoadBalancing"
+    / "results"
+    / "classified_workload.csv"
+)
+
+CARBON_WORKLOAD_FILE = (
+    PROJECT_ROOT
+    / "Coding"
+    / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "Coding"
+    / "LoadBalancing"
+    / "results"
+    / "forecast_assisted"
+)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INTERVAL_SECONDS = 60
+
+DEADLINE_SCENARIOS = [15, 30, 60]
+
+CONCURRENCY_CAPACITY = 20
+
+CARBON_COLUMN = "carbon_intensity_lifecycle"
+
+IMMEDIATE_LABEL = "IMMEDIATE"
+DELAY_TOLERANT_LABEL = "DELAY_TOLERANT"
+
+
+# =========================================================
+# 2. LOAD DATA
+# =========================================================
+
+def load_data():
+
+    if not CLASSIFIED_FILE.exists():
+        raise FileNotFoundError(CLASSIFIED_FILE)
+
+    if not CARBON_WORKLOAD_FILE.exists():
+        raise FileNotFoundError(CARBON_WORKLOAD_FILE)
+
+    jobs = pd.read_csv(CLASSIFIED_FILE)
+
+    workload = pd.read_csv(CARBON_WORKLOAD_FILE)
+
+    required_job_columns = [
+        "start_timestamp",
+        "duration",
+    ]
+
+    for column in required_job_columns:
+        if column not in jobs.columns:
+            raise ValueError(
+                f"Missing job column: {column}"
+            )
+
+    category_candidates = [
+        "workload_category",
+        "workload_type",
+        "workload_class",
+        "category",
+    ]
+
+    category_column = next(
+        (
+            column
+            for column in category_candidates
+            if column in jobs.columns
+        ),
+        None,
+    )
+
+    if category_column is None:
+        raise ValueError(
+            "Could not find workload category column. "
+            f"Available columns: {list(jobs.columns)}"
+        )
+
+    required_workload_columns = [
+        "minute",
+        "invocation_count",
+        "maximum_concurrency",
+        CARBON_COLUMN,
+    ]
+
+    for column in required_workload_columns:
+        if column not in workload.columns:
+            raise ValueError(
+                f"Missing workload column: {column}"
+            )
+
+    jobs["start_timestamp"] = pd.to_numeric(
+        jobs["start_timestamp"],
+        errors="raise",
+    )
+
+    jobs["duration"] = pd.to_numeric(
+        jobs["duration"],
+        errors="raise",
+    )
+
+    workload = workload.sort_values(
+        "minute"
+    ).reset_index(drop=True)
+
+    jobs[category_column] = (
+        jobs[category_column]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace("-", "_", regex=False)
+        .str.replace(" ", "_", regex=False)
+    )
+
+    workload["minute"] = pd.to_numeric(
+        workload["minute"],
+        errors="raise",
+    ).astype(int)
+
+    if jobs["start_timestamp"].isna().any():
+        raise ValueError("Missing job start timestamps.")
+
+    if jobs["duration"].isna().any():
+        raise ValueError("Missing job durations.")
+
+    if (jobs["duration"] < 0).any():
+        raise ValueError("Negative durations found.")
+
+    if workload["minute"].duplicated().any():
+        raise ValueError("Duplicate workload minutes found.")
+
+    expected_minutes = np.arange(len(workload))
+
+    if not np.array_equal(
+        workload["minute"].to_numpy(),
+        expected_minutes,
+    ):
+        raise ValueError(
+            "Workload minute index must be continuous "
+            "and start from zero."
+        )
+
+    jobs["workload_category"] = jobs[category_column]
+
+    print("\nDATA LOADED")
+    print("-----------")
+    print(f"Total jobs: {len(jobs):,}")
+    print(f"Workload minutes: {len(workload):,}")
+    print(f"Category column: {category_column}")
+
+    return jobs, workload
+
+
+# =========================================================
+# 3. CREATE ONE-MINUTE-AHEAD FORECASTS
+# =========================================================
+
+def create_forecasts(workload):
+
+    forecast = workload[
+        [
+            "minute",
+            "invocation_count",
+            "maximum_concurrency",
+        ]
+    ].copy()
+
+    # -----------------------------------------------------
+    # Invocation count:
+    # Validated 5-minute moving average.
+    # -----------------------------------------------------
+
+    rolling_prediction = (
+        forecast["invocation_count"]
+        .rolling(
+            window=5,
+            min_periods=5,
+        )
+        .mean()
+    )
+
+    # At minute t, forecast the invocation count at t+1.
+    # The first four observations have no five-minute
+    # history, so persistence is used as a fallback.
+
+    invocation_forecast = rolling_prediction.to_numpy()
+
+    actual_invocations = (
+        forecast["invocation_count"].to_numpy(dtype=float)
+    )
+
+    invocation_forecast = np.where(
+        np.isfinite(invocation_forecast),
+        invocation_forecast,
+        actual_invocations,
+    )
+
+    # -----------------------------------------------------
+    # Maximum concurrency:
+    # Validated persistence baseline.
+    # -----------------------------------------------------
+
+    actual_concurrency = (
+        forecast["maximum_concurrency"]
+        .to_numpy(dtype=float)
+    )
+
+    # Forecast for minute t+1 uses observed concurrency at t.
+    concurrency_forecast = np.empty(
+        len(forecast),
+        dtype=float,
+    )
+
+    concurrency_forecast[0] = actual_concurrency[0]
+
+    concurrency_forecast[1:] = (
+        actual_concurrency[:-1]
+    )
+
+    forecast["predicted_invocation_count_next_minute"] = (
+        np.maximum(invocation_forecast, 0)
+    )
+
+    forecast["predicted_maximum_concurrency_next_minute"] = (
+        np.maximum(concurrency_forecast, 0)
+    )
+
+    forecast["predicted_required_instances"] = (
+        np.ceil(
+            forecast[
+                "predicted_maximum_concurrency_next_minute"
+            ]
+            / CONCURRENCY_CAPACITY
+        )
+        .astype(int)
+    )
+
+    # Forecast at minute k is based on observations
+    # available at minute k-1.
+    forecast["forecast_for_minute"] = (
+        forecast["minute"] + 1
+    )
+
+    forecast.to_csv(
+        OUTPUT_DIR / "workload_forecasts.csv",
+        index=False,
+    )
+
+    print("\nFORECASTS CREATED")
+    print("-----------------")
+    print("Invocation count: 5-minute moving average")
+    print("Maximum concurrency: persistence")
+    print("Forecast horizon: 1 minute")
+    print(
+        "Capacity per simulated instance:",
+        CONCURRENCY_CAPACITY,
+    )
+
+    return forecast
+
+
+# =========================================================
+# 4. CREATE CARBON-BASED SCHEDULE
+# =========================================================
+
+def schedule_jobs(
+    jobs,
+    workload,
+    deadline_minutes,
+):
+
+    carbon = workload[
+        CARBON_COLUMN
+    ].to_numpy(dtype=float)
+
+    number_of_minutes = len(carbon)
+
+    if not np.isfinite(carbon).all():
+        raise ValueError(
+            "Missing or invalid carbon intensity values."
+        )
+
+    starts = jobs[
+        "start_timestamp"
+    ].to_numpy(dtype=float)
+
+    durations = jobs[
+        "duration"
+    ].to_numpy(dtype=float)
+
+    original_minutes = np.floor(
+        starts / INTERVAL_SECONDS
+    ).astype(int)
+
+    if (
+        original_minutes.min() < 0
+        or original_minutes.max() >= number_of_minutes
+    ):
+        raise ValueError(
+            "Some jobs are outside the carbon dataset timeline."
+        )
+
+    categories = jobs[
+        "workload_category"
+    ].to_numpy()
+
+    immediate_mask = (
+        categories == IMMEDIATE_LABEL
+    )
+
+    tolerant_mask = (
+        categories == DELAY_TOLERANT_LABEL
+    )
+
+    if not np.all(
+        immediate_mask | tolerant_mask
+    ):
+        unknown = np.unique(
+            categories[~(immediate_mask | tolerant_mask)]
+        )
+
+        raise ValueError(
+            f"Unexpected workload categories: {unknown}"
+        )
+
+    # Initially, all jobs remain at original timestamps.
+    scheduled_starts = starts.copy()
+
+    # Record selected execution minute for each job.
+    scheduled_minutes = original_minutes.copy()
+
+    # -----------------------------------------------------
+    # Group delay-tolerant jobs by original minute.
+    # This avoids iterating over all 594,285 jobs.
+    # -----------------------------------------------------
+
+    tolerant_original_minutes = np.unique(
+        original_minutes[tolerant_mask]
+    )
+
+    delayed_groups = 0
+
+    for original_minute in tolerant_original_minutes:
+
+        deadline_minute = min(
+            original_minute + deadline_minutes,
+            number_of_minutes - 1,
+        )
+
+        candidate_minutes = np.arange(
+            original_minute,
+            deadline_minute + 1,
+        )
+
+        candidate_carbon = carbon[
+            candidate_minutes
+        ]
+
+        best_position = int(
+            np.argmin(candidate_carbon)
+        )
+
+        best_minute = int(
+            candidate_minutes[best_position]
+        )
+
+        original_carbon = carbon[
+            original_minute
+        ]
+
+        best_carbon = carbon[
+            best_minute
+        ]
+
+        # Shift only when carbon intensity is strictly lower.
+        if best_carbon < original_carbon:
+
+            selected_mask = (
+                tolerant_mask
+                & (original_minutes == original_minute)
+            )
+
+            scheduled_minutes[selected_mask] = (
+                best_minute
+            )
+
+            scheduled_starts[selected_mask] = (
+                best_minute * INTERVAL_SECONDS
+            )
+
+            delayed_groups += 1
+
+    waiting_seconds = (
+        scheduled_starts - starts
+    )
+
+    scheduled_ends = (
+        scheduled_starts + durations
+    )
+
+    # -----------------------------------------------------
+    # Build result.
+    # -----------------------------------------------------
+
+    result = jobs.copy()
+
+    result["original_start_timestamp"] = starts
+
+    result["scheduled_start_timestamp"] = (
+        scheduled_starts
+    )
+
+    result["scheduled_end_timestamp"] = (
+        scheduled_ends
+    )
+
+    result["original_minute"] = original_minutes
+
+    result["scheduled_minute"] = scheduled_minutes
+
+    result["waiting_time_seconds"] = waiting_seconds
+
+    result["original_carbon_intensity"] = (
+        carbon[original_minutes]
+    )
+
+    result["scheduled_carbon_intensity"] = (
+        carbon[scheduled_minutes]
+    )
+
+    # Forecasted capacity requirement at the selected minute.
+    actual_concurrency = (
+        workload["maximum_concurrency"]
+        .to_numpy(dtype=float)
+    )
+
+    predicted_concurrency = np.empty(
+        number_of_minutes,
+        dtype=float,
+    )
+
+    predicted_concurrency[0] = (
+        actual_concurrency[0]
+    )
+
+    predicted_concurrency[1:] = (
+        actual_concurrency[:-1]
+    )
+
+    result["forecast_maximum_concurrency"] = (
+        predicted_concurrency[scheduled_minutes]
+    )
+
+    result["forecast_required_instances"] = (
+        np.ceil(
+            result["forecast_maximum_concurrency"]
+            / CONCURRENCY_CAPACITY
+        )
+        .astype(int)
+    )
+
+    # This is an advisory forecast, not a hard capacity limit.
+    result["scheduling_strategy"] = (
+        f"FORECAST_ASSISTED_{deadline_minutes}MIN"
+    )
+
+    return result, delayed_groups
+
+
+# =========================================================
+# 5. EVALUATE SCHEDULE
+# =========================================================
+
+def evaluate_schedule(
+    result,
+    deadline_minutes,
+    delayed_groups,
+):
+
+    immediate = result[
+        result["workload_category"] == IMMEDIATE_LABEL
+    ]
+
+    tolerant = result[
+        result["workload_category"] == DELAY_TOLERANT_LABEL
+    ]
+
+    delayed = tolerant[
+        tolerant["waiting_time_seconds"] > 0
+    ]
+
+    original_average_carbon = (
+        tolerant["original_carbon_intensity"].mean()
+    )
+
+    scheduled_average_carbon = (
+        tolerant["scheduled_carbon_intensity"].mean()
+    )
+
+    if original_average_carbon > 0:
+
+        carbon_intensity_change_percent = (
+            (
+                original_average_carbon
+                - scheduled_average_carbon
+            )
+            / original_average_carbon
+        ) * 100
+
+    else:
+        carbon_intensity_change_percent = 0.0
+
+    summary = {
+        "deadline_minutes": deadline_minutes,
+        "total_invocations": len(result),
+        "immediate_invocations": len(immediate),
+        "delay_tolerant_invocations": len(tolerant),
+        "delayed_invocations": len(delayed),
+        "delayed_percentage": (
+            len(delayed) / len(tolerant) * 100
+            if len(tolerant) else 0
+        ),
+        "delayed_original_minute_groups": delayed_groups,
+        "average_waiting_seconds": (
+            tolerant["waiting_time_seconds"].mean()
+            if len(tolerant) else 0
+        ),
+        "maximum_waiting_seconds": (
+            result["waiting_time_seconds"].max()
+        ),
+        "average_original_carbon_intensity": (
+            original_average_carbon
+        ),
+        "average_scheduled_carbon_intensity": (
+            scheduled_average_carbon
+        ),
+        "carbon_intensity_change_percent": (
+            carbon_intensity_change_percent
+        ),
+        "average_forecast_required_instances": (
+            result["forecast_required_instances"].mean()
+        ),
+        "maximum_forecast_required_instances": (
+            result["forecast_required_instances"].max()
+        ),
+    }
+
+    # -----------------------------------------------------
+    # VALIDATION
+    # -----------------------------------------------------
+
+    assert len(result) > 0
+
+    assert (
+        result["waiting_time_seconds"] >= 0
+    ).all()
+
+    assert (
+        result["scheduled_start_timestamp"]
+        >= result["original_start_timestamp"]
+    ).all()
+
+    assert (
+        result["scheduled_end_timestamp"]
+        - result["scheduled_start_timestamp"]
+        - result["duration"]
+    ).abs().max() < 1e-8
+
+    assert (
+        result["waiting_time_seconds"]
+        <= deadline_minutes * 60 + 1e-8
+    ).all()
+
+    # Immediate jobs must never be delayed.
+    assert (
+        immediate["waiting_time_seconds"] == 0
+    ).all()
+
+    # Carbon intensity should never increase for shifted jobs.
+    assert (
+        result.loc[
+            result["waiting_time_seconds"] > 0,
+            "scheduled_carbon_intensity",
+        ]
+        <
+        result.loc[
+            result["waiting_time_seconds"] > 0,
+            "original_carbon_intensity",
+        ]
+    ).all()
+
+    return summary
+
+
+# =========================================================
+# 6. MAIN
+# =========================================================
+
+def main():
+
+    print("\nFORECAST-ASSISTED LOAD BALANCING")
+    print("================================")
+
+    jobs, workload = load_data()
+
+    forecasts = create_forecasts(workload)
+
+    summaries = []
+
+    for deadline in DEADLINE_SCENARIOS:
+
+        print(f"\nRUNNING {deadline}-MINUTE SCENARIO")
+        print("-" * 45)
+
+        result, delayed_groups = schedule_jobs(
+            jobs,
+            workload,
+            deadline,
+        )
+
+        summary = evaluate_schedule(
+            result,
+            deadline,
+            delayed_groups,
+        )
+
+        summaries.append(summary)
+
+        output_file = (
+            OUTPUT_DIR
+            / f"forecast_assisted_schedule_{deadline}min.csv"
+        )
+
+        result.to_csv(
+            output_file,
+            index=False,
+        )
+
+        print(f"Total jobs: {summary['total_invocations']:,}")
+        print(f"Delayed jobs: {summary['delayed_invocations']:,}")
+        print(
+            f"Average waiting: "
+            f"{summary['average_waiting_seconds']:.2f} seconds"
+        )
+        print(
+            f"Average carbon intensity: "
+            f"{summary['average_original_carbon_intensity']:.2f}"
+            f" -> "
+            f"{summary['average_scheduled_carbon_intensity']:.2f}"
+        )
+        print(
+            f"Carbon intensity change: "
+            f"{summary['carbon_intensity_change_percent']:.4f}%"
+        )
+
+        print(f"Saved: {output_file}")
+
+        print("\nPASS: Schedule validation completed.")
+
+    # -----------------------------------------------------
+    # SAVE SUMMARY
+    # -----------------------------------------------------
+
+    summary_df = pd.DataFrame(summaries)
+
+    summary_file = (
+        OUTPUT_DIR
+        / "forecast_assisted_summary.csv"
+    )
+
+    summary_df.to_csv(
+        summary_file,
+        index=False,
+    )
+
+    print("\nALL SCENARIOS COMPLETED")
+    print("=======================")
+
+    print(
+        summary_df.to_string(index=False)
+    )
+
+    print("\nOutput directory:")
+    print(OUTPUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: Coding/LoadBalancing/compare_all_strategies.py
+================================================
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parents[2]
+
+RESULTS = ROOT / "Coding" / "LoadBalancing" / "results"
+CARBON_FILE = (
+    ROOT / "Coding" / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = RESULTS / "consolidated_evaluation"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEADLINES = [15, 30, 60]
+
+CAPACITY_PER_INSTANCE = 20
+IDLE_POWER_WATTS = 44
+PEAK_POWER_WATTS = 125
+
+CAPACITY_CEILING = 3027
+
+MEMORY_GB = 1.0
+EXECUTION_PRICE_PER_MILLION = 0.20
+GB_SECOND_PRICE = 0.000016
+MIN_BILLABLE_SECONDS = 0.100
+BILLING_ROUNDING_SECONDS = 0.001
+
+
+# ============================================================
+# STRATEGY FILES
+# ============================================================
+
+STRATEGIES = {
+    "Baseline": (
+        RESULTS,
+        "baseline_schedule.csv",
+        "Not applicable"
+    ),
+    "Carbon_Aware": (
+        RESULTS,
+        "carbon_aware_schedule_{deadline}min.csv",
+        "Not enforced"
+    ),
+    "Multi_Objective": (
+        RESULTS,
+        "multi_objective_schedule_{deadline}min.csv",
+        "Not enforced"
+    ),
+    "Forecast_Assisted": (
+        RESULTS / "forecast_assisted",
+        "forecast_assisted_schedule_{deadline}min.csv",
+        "Advisory only"
+    ),
+    "Approx_Capacity": (
+        RESULTS / "capacity_constrained",
+        "capacity_constrained_schedule_{deadline}min.csv",
+        "Approximate"
+    ),
+    "One_Second_Slot_Capacity": (
+        RESULTS / "exact_capacity",
+        "exact_capacity_schedule_{deadline}min.csv",
+        "One-second-slot model"
+    )
+}
+
+
+# ============================================================
+# LOAD CARBON DATA
+# ============================================================
+
+def load_carbon_data():
+    carbon = pd.read_csv(
+        CARBON_FILE,
+        usecols=["minute", "carbon_intensity_lifecycle"]
+    ).sort_values("minute")
+
+    minutes = carbon["minute"].to_numpy(dtype=int)
+    values = carbon[
+        "carbon_intensity_lifecycle"
+    ].to_numpy(dtype=float)
+
+    if not np.array_equal(minutes, np.arange(len(minutes))):
+        raise ValueError("Carbon minute timeline is not continuous.")
+
+    if not np.isfinite(values).all():
+        raise ValueError("Invalid carbon intensity values.")
+
+    return values
+
+
+# ============================================================
+# READ ONLY REQUIRED SCHEDULE COLUMNS
+# ============================================================
+
+def load_schedule(path):
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+
+    required = {
+        "duration",
+        "scheduled_start_timestamp"
+    }
+
+    original_column = (
+        "original_start_timestamp"
+        if "original_start_timestamp" in header
+        else "start_timestamp"
+    )
+
+    required.add(original_column)
+
+    optional = {
+        "workload_type",
+        "waiting_time_seconds"
+    }
+
+    selected = [
+        column for column in header
+        if column in required or column in optional
+    ]
+
+    missing = required.difference(selected)
+
+    if missing:
+        raise ValueError(
+            f"{path.name} is missing columns: {sorted(missing)}"
+        )
+
+    return pd.read_csv(path, usecols=selected), original_column
+
+
+# ============================================================
+# FAST EVENT-BASED ENERGY AND CARBON MODEL
+# ============================================================
+
+def calculate_energy_and_carbon(schedule, carbon_values):
+
+    starts = schedule[
+        "scheduled_start_timestamp"
+    ].to_numpy(dtype=float)
+
+    durations = schedule["duration"].to_numpy(dtype=float)
+
+    valid = (
+        np.isfinite(starts)
+        & np.isfinite(durations)
+        & (durations > 0)
+    )
+
+    starts = starts[valid]
+    durations = durations[valid]
+
+    if len(starts) == 0:
+        return {
+            "energy_kwh": 0.0,
+            "carbon_emissions_kg": 0.0,
+            "maximum_concurrency": 0,
+            "maximum_instances": 0
+        }
+
+    ends = starts + durations
+
+    event_times = np.concatenate([starts, ends])
+    event_changes = np.concatenate([
+        np.ones(len(starts), dtype=np.int32),
+        -np.ones(len(ends), dtype=np.int32)
+    ])
+
+    order = np.argsort(event_times, kind="stable")
+    event_times = event_times[order]
+    event_changes = event_changes[order]
+
+    unique_times, first_indices = np.unique(
+        event_times,
+        return_index=True
+    )
+
+    net_changes = np.add.reduceat(
+        event_changes,
+        first_indices
+    )
+
+    cumulative_active = np.concatenate([
+        np.array([0], dtype=np.int64),
+        np.cumsum(net_changes, dtype=np.int64)
+    ])
+
+    maximum_concurrency = int(cumulative_active.max())
+
+    # Add minute boundaries so each segment uses one carbon value.
+    timeline_end = len(carbon_values) * 60
+
+    if starts.min() < 0 or ends.max() > timeline_end:
+        raise ValueError(
+            "Schedule extends outside the carbon timeline."
+        )
+
+    minute_boundaries = np.arange(
+        0,
+        timeline_end + 60,
+        60,
+        dtype=float
+    )
+
+    breakpoints = np.unique(np.concatenate([
+        unique_times,
+        minute_boundaries
+    ]))
+
+    event_positions = np.searchsorted(
+        unique_times,
+        breakpoints[:-1],
+        side="right"
+    )
+
+    active = cumulative_active[event_positions]
+
+    seconds = np.diff(breakpoints)
+
+    minutes = (
+        breakpoints[:-1] // 60
+    ).astype(int)
+
+    valid_segments = (
+        (active > 0)
+        & (seconds > 0)
+        & (minutes >= 0)
+        & (minutes < len(carbon_values))
+    )
+
+    active = active[valid_segments]
+    seconds = seconds[valid_segments]
+    minutes = minutes[valid_segments]
+
+    instances = (
+        active + CAPACITY_PER_INSTANCE - 1
+    ) // CAPACITY_PER_INSTANCE
+
+    utilisation = active / (
+        instances * CAPACITY_PER_INSTANCE
+    )
+
+    power = instances * (
+        IDLE_POWER_WATTS
+        + utilisation * (
+            PEAK_POWER_WATTS - IDLE_POWER_WATTS
+        )
+    )
+
+    segment_energy = (
+        power * seconds / 3600
+    ) / 1000
+
+    energy_kwh = float(segment_energy.sum())
+
+    carbon_kg = float(
+        np.sum(
+            segment_energy
+            * carbon_values[minutes] / 1000
+        )
+    )
+
+    maximum_instances = math.ceil(
+        maximum_concurrency / CAPACITY_PER_INSTANCE
+    )
+
+    return {
+        "energy_kwh": energy_kwh,
+        "carbon_emissions_kg": carbon_kg,
+        "maximum_concurrency": maximum_concurrency,
+        "maximum_instances": maximum_instances
+    }
+
+
+# ============================================================
+# AZURE COST ESTIMATION
+# ============================================================
+
+def calculate_cost(schedule):
+
+    durations = schedule["duration"].to_numpy(dtype=float)
+
+    durations = durations[
+        np.isfinite(durations) & (durations >= 0)
+    ]
+
+    rounded = (
+        np.ceil(
+            durations / BILLING_ROUNDING_SECONDS
+        ) * BILLING_ROUNDING_SECONDS
+    )
+
+    billable = np.maximum(
+        rounded,
+        MIN_BILLABLE_SECONDS
+    )
+
+    count = len(billable)
+    gb_seconds = float(billable.sum() * MEMORY_GB)
+
+    execution_cost = (
+        count / 1_000_000
+    ) * EXECUTION_PRICE_PER_MILLION
+
+    resource_cost = gb_seconds * GB_SECOND_PRICE
+
+    return {
+        "invocation_count": count,
+        "total_gb_seconds": gb_seconds,
+        "execution_cost_usd": execution_cost,
+        "resource_cost_usd": resource_cost,
+        "total_cost_usd": execution_cost + resource_cost
+    }
+
+
+# ============================================================
+# WAITING TIME AND DEADLINE METRICS
+# ============================================================
+
+def calculate_scheduling_metrics(
+    schedule,
+    original_column,
+    deadline
+):
+    original = schedule[
+        original_column
+    ].to_numpy(dtype=float)
+
+    scheduled = schedule[
+        "scheduled_start_timestamp"
+    ].to_numpy(dtype=float)
+
+    waiting = scheduled - original
+
+    if "waiting_time_seconds" in schedule.columns:
+        supplied_wait = schedule[
+            "waiting_time_seconds"
+        ].to_numpy(dtype=float)
+
+        valid_supplied = np.isfinite(supplied_wait)
+
+        waiting[valid_supplied] = supplied_wait[valid_supplied]
+
+    waiting = np.maximum(waiting, 0)
+
+    delayed = waiting > 1e-6
+
+    if "workload_type" in schedule.columns:
+        workload_types = (
+            schedule["workload_type"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .to_numpy()
+        )
+
+        tolerant = workload_types == "DELAY_TOLERANT"
+        immediate = workload_types == "IMMEDIATE"
+    else:
+        tolerant = np.ones(len(waiting), dtype=bool)
+        immediate = np.zeros(len(waiting), dtype=bool)
+
+    tolerant_count = int(tolerant.sum())
+    delayed_count = int((delayed & tolerant).sum())
+
+    compliant = (
+        waiting[tolerant] <= deadline * 60 + 1e-6
+    )
+
+    deadline_compliance = (
+        float(compliant.mean() * 100)
+        if tolerant_count else 100.0
+    )
+
+    return {
+        "delayed_invocations": int(delayed.sum()),
+        "delayed_tolerant_invocations": delayed_count,
+        "average_waiting_seconds": float(
+            waiting[tolerant].mean()
+        ) if tolerant_count else 0.0,
+        "maximum_waiting_seconds": float(
+            waiting[tolerant].max()
+        ) if tolerant_count else 0.0,
+        "deadline_compliance_percent": deadline_compliance,
+        "immediate_invocations_delayed": int(
+            (delayed & immediate).sum()
+        )
+    }
+
+
+# ============================================================
+# EVALUATE ONE SCHEDULE
+# ============================================================
+
+def evaluate_one(
+    strategy,
+    deadline,
+    path,
+    capacity_status,
+    carbon_values
+):
+
+    print(f"  Reading {path.name} ...", flush=True)
+
+    schedule, original_column = load_schedule(path)
+
+    energy = calculate_energy_and_carbon(
+        schedule,
+        carbon_values
+    )
+
+    cost = calculate_cost(schedule)
+
+    timing = calculate_scheduling_metrics(
+        schedule,
+        original_column,
+        deadline
+    )
+
+    peak = energy["maximum_concurrency"]
+
+    if strategy == "Baseline":
+        capacity_compliance = "Baseline reference"
+    elif capacity_status in (
+        "Approximate",
+        "One-second-slot model"
+    ):
+        capacity_compliance = (
+            "PASS" if peak <= CAPACITY_CEILING else "FAIL"
+        )
+    else:
+        capacity_compliance = "Not enforced"
+
+    return {
+        "strategy": strategy,
+        "deadline_minutes": deadline,
+        **energy,
+        **cost,
+        **timing,
+        "capacity_ceiling": CAPACITY_CEILING,
+        "capacity_model": capacity_status,
+        "capacity_compliance": capacity_compliance
+    }
+
+
+# ============================================================
+# MAIN COMPARISON
+# ============================================================
+
+def main():
+
+    print("\nCONSOLIDATED LOAD-BALANCING EVALUATION")
+    print("=" * 60)
+
+    carbon_values = load_carbon_data()
+
+    results = []
+
+    # Baseline is common to all deadline scenarios.
+    baseline_path = RESULTS / "baseline_schedule.csv"
+
+    baseline_rows = {}
+
+    print("\nEvaluating baseline...")
+
+    for deadline in DEADLINES:
+        baseline_rows[deadline] = evaluate_one(
+            "Baseline",
+            deadline,
+            baseline_path,
+            "Not applicable",
+            carbon_values
+        )
+
+    results.extend(baseline_rows.values())
+
+    # Evaluate the five scheduling approaches.
+    for strategy, (
+        directory,
+        filename_pattern,
+        capacity_status
+    ) in STRATEGIES.items():
+
+        if strategy == "Baseline":
+            continue
+
+        for deadline in DEADLINES:
+
+            filename = filename_pattern.format(
+                deadline=deadline
+            )
+
+            path = directory / filename
+
+            if not path.exists():
+                raise FileNotFoundError(path)
+
+            print(
+                f"\nEvaluating {strategy}, "
+                f"{deadline}-minute window..."
+            )
+
+            row = evaluate_one(
+                strategy,
+                deadline,
+                path,
+                capacity_status,
+                carbon_values
+            )
+
+            baseline = baseline_rows[deadline]
+
+            for metric in [
+                "energy_kwh",
+                "carbon_emissions_kg",
+                "total_cost_usd"
+            ]:
+                original = baseline[metric]
+                current = row[metric]
+
+                row[f"{metric}_reduction_percent"] = (
+                    (original - current) / original * 100
+                    if original else 0.0
+                )
+
+            results.append(row)
+
+    df = pd.DataFrame(results)
+
+    output_csv = (
+        OUTPUT_DIR / "consolidated_strategy_comparison.csv"
+    )
+
+    df.to_csv(output_csv, index=False)
+
+    # --------------------------------------------------------
+    # BEST STRATEGY SUMMARY
+    # --------------------------------------------------------
+
+    proposed = df[df["strategy"] != "Baseline"].copy()
+
+    best = (
+        proposed.sort_values("carbon_emissions_kg")
+        .groupby("deadline_minutes", as_index=False)
+        .first()
+    )
+
+    best.to_csv(
+        OUTPUT_DIR / "best_strategy_by_deadline.csv",
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # GRAPH 1: ENERGY
+    # --------------------------------------------------------
+
+    pivot_energy = df.pivot(
+        index="strategy",
+        columns="deadline_minutes",
+        values="energy_kwh"
+    )
+
+    pivot_energy.plot(
+        kind="bar",
+        figsize=(12, 6)
+    )
+
+    plt.ylabel("Energy (kWh)")
+    plt.xlabel("Scheduling strategy")
+    plt.title("Energy Consumption Comparison")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTPUT_DIR / "energy_comparison.png",
+        dpi=200
+    )
+    plt.close()
+
+    # --------------------------------------------------------
+    # GRAPH 2: CARBON
+    # --------------------------------------------------------
+
+    pivot_carbon = df.pivot(
+        index="strategy",
+        columns="deadline_minutes",
+        values="carbon_emissions_kg"
+    )
+
+    pivot_carbon.plot(
+        kind="bar",
+        figsize=(12, 6)
+    )
+
+    plt.ylabel("Carbon emissions (kg CO2eq)")
+    plt.xlabel("Scheduling strategy")
+    plt.title("Carbon Emissions Comparison")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTPUT_DIR / "carbon_comparison.png",
+        dpi=200
+    )
+    plt.close()
+
+    # --------------------------------------------------------
+    # GRAPH 3: AVERAGE WAITING TIME
+    # --------------------------------------------------------
+
+    pivot_wait = df.pivot(
+        index="strategy",
+        columns="deadline_minutes",
+        values="average_waiting_seconds"
+    )
+
+    pivot_wait.plot(
+        kind="bar",
+        figsize=(12, 6)
+    )
+
+    plt.ylabel("Average waiting time (seconds)")
+    plt.xlabel("Scheduling strategy")
+    plt.title("Average Waiting Time Comparison")
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTPUT_DIR / "waiting_time_comparison.png",
+        dpi=200
+    )
+    plt.close()
+
+    # --------------------------------------------------------
+    # GRAPH 4: CARBON REDUCTION
+    # --------------------------------------------------------
+
+    reduction_column = "carbon_emissions_kg_reduction_percent"
+
+    reduction = proposed.pivot(
+        index="strategy",
+        columns="deadline_minutes",
+        values=reduction_column
+    )
+
+    reduction.plot(
+        kind="bar",
+        figsize=(12, 6)
+    )
+
+    plt.ylabel("Carbon reduction (%)")
+    plt.xlabel("Scheduling strategy")
+    plt.title("Carbon Reduction Compared With Baseline")
+    plt.axhline(0, linewidth=0.8)
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTPUT_DIR / "carbon_reduction_comparison.png",
+        dpi=200
+    )
+    plt.close()
+
+    # --------------------------------------------------------
+    # DISPLAY RESULTS
+    # --------------------------------------------------------
+
+    columns = [
+        "strategy",
+        "deadline_minutes",
+        "energy_kwh",
+        "carbon_emissions_kg",
+        "total_cost_usd",
+        "delayed_tolerant_invocations",
+        "average_waiting_seconds",
+        "deadline_compliance_percent",
+        "maximum_concurrency",
+        "capacity_compliance"
+    ]
+
+    print("\n\nFINAL COMPARISON")
+    print("=" * 90)
+
+    print(
+        df[columns].round(4).to_string(index=False)
+    )
+
+    print("\nSaved results to:")
+    print(OUTPUT_DIR)
+
+    print("\nGenerated files:")
+    print("- consolidated_strategy_comparison.csv")
+    print("- best_strategy_by_deadline.csv")
+    print("- energy_comparison.png")
+    print("- carbon_comparison.png")
+    print("- waiting_time_comparison.png")
+    print("- carbon_reduction_comparison.png")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: Coding/LoadBalancing/evaluate_scheduled_strategies.py
+================================================
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parents[2]
+
+SCHEDULE_DIR = (
+    ROOT / "Coding" / "LoadBalancing" / "results"
+    / "forecast_assisted"
+)
+
+CARBON_FILE = (
+    ROOT / "Coding" / "CarbonAnalysis"
+    / "workload_carbon_dataset.csv"
+)
+
+OUTPUT_DIR = SCHEDULE_DIR / "evaluation"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEADLINES = [15, 30, 60]
+
+# Existing simulated energy model assumptions
+CAPACITY_PER_INSTANCE = 20
+IDLE_POWER_WATTS = 44
+PEAK_POWER_WATTS = 125
+
+# Azure Consumption-plan pricing assumptions
+MEMORY_GB = 1.0
+EXECUTION_PRICE_PER_MILLION = 0.20
+GB_SECOND_PRICE = 0.000016
+
+MIN_BILLABLE_SECONDS = 0.100
+BILLING_ROUNDING_SECONDS = 0.001
+
+
+# ============================================================
+# LOAD CARBON DATA
+# ============================================================
+
+def load_carbon_data():
+
+    carbon = pd.read_csv(CARBON_FILE)
+
+    required = ["minute", "carbon_intensity_lifecycle"]
+
+    for column in required:
+        if column not in carbon.columns:
+            raise ValueError(
+                f"Missing carbon column: {column}. "
+                f"Available: {carbon.columns.tolist()}"
+            )
+
+    carbon = carbon.sort_values("minute").reset_index(drop=True)
+
+    if carbon["minute"].duplicated().any():
+        raise ValueError("Duplicate minute values in carbon dataset.")
+
+    carbon_values = carbon["carbon_intensity_lifecycle"].to_numpy(
+        dtype=float
+    )
+
+    minute_values = carbon["minute"].to_numpy(dtype=int)
+
+    if not np.array_equal(
+        minute_values,
+        np.arange(len(minute_values))
+    ):
+        raise ValueError(
+            "Carbon minute timeline must be continuous from zero."
+        )
+
+    if not np.isfinite(carbon_values).all():
+        raise ValueError("Carbon dataset contains invalid values.")
+
+    return carbon_values
+
+
+# ============================================================
+# ENERGY AND CARBON CALCULATION
+# ============================================================
+
+def calculate_energy_and_carbon(schedule, carbon_values):
+
+    starts = schedule["scheduled_start_timestamp"].to_numpy(
+        dtype=float
+    )
+
+    durations = schedule["duration"].to_numpy(dtype=float)
+
+    valid = (
+        np.isfinite(starts)
+        & np.isfinite(durations)
+        & (durations > 0)
+    )
+
+    starts = starts[valid]
+    durations = durations[valid]
+
+    ends = starts + durations
+
+    # Event: (timestamp, concurrency change)
+    events = []
+
+    for start, end in zip(starts, ends):
+        events.append((start, 1))
+        events.append((end, -1))
+
+    events.sort(key=lambda item: item[0])
+
+    active = 0
+    previous_time = None
+
+    total_energy_kwh = 0.0
+    total_carbon_kg = 0.0
+    maximum_concurrency = 0
+    maximum_instances = 0
+
+    index = 0
+
+    while index < len(events):
+
+        current_time = events[index][0]
+
+        # Integrate the interval before processing current events.
+        if previous_time is not None and current_time > previous_time:
+
+            interval_start = previous_time
+            interval_end = current_time
+
+            while interval_start < interval_end and active > 0:
+
+                minute = int(interval_start // 60)
+
+                if minute < 0 or minute >= len(carbon_values):
+                    raise ValueError(
+                        f"Scheduled minute {minute} is outside "
+                        "the carbon timeline."
+                    )
+
+                next_minute_boundary = (minute + 1) * 60
+
+                segment_end = min(
+                    interval_end,
+                    next_minute_boundary
+                )
+
+                segment_seconds = segment_end - interval_start
+
+                instances = math.ceil(
+                    active / CAPACITY_PER_INSTANCE
+                )
+
+                utilisation = active / (
+                    instances * CAPACITY_PER_INSTANCE
+                )
+
+                power_watts = instances * (
+                    IDLE_POWER_WATTS
+                    + utilisation * (
+                        PEAK_POWER_WATTS - IDLE_POWER_WATTS
+                    )
+                )
+
+                energy_kwh = (
+                    power_watts * segment_seconds / 3600
+                ) / 1000
+
+                carbon_kg = (
+                    energy_kwh * carbon_values[minute] / 1000
+                )
+
+                total_energy_kwh += energy_kwh
+                total_carbon_kg += carbon_kg
+
+                interval_start = segment_end
+
+        # Process all events at the same timestamp.
+        while (
+            index < len(events)
+            and events[index][0] == current_time
+        ):
+            active += events[index][1]
+            index += 1
+
+        if active < 0:
+            raise ValueError("Invalid concurrency event sequence.")
+
+        maximum_concurrency = max(
+            maximum_concurrency, active
+        )
+
+        maximum_instances = max(
+            maximum_instances,
+            math.ceil(active / CAPACITY_PER_INSTANCE)
+        )
+
+        previous_time = current_time
+
+    return {
+        "energy_kwh": total_energy_kwh,
+        "carbon_emissions_kg": total_carbon_kg,
+        "maximum_concurrency": maximum_concurrency,
+        "maximum_instances": maximum_instances
+    }
+
+
+# ============================================================
+# AZURE COST ESTIMATION
+# ============================================================
+
+def calculate_azure_cost(schedule):
+
+    durations = schedule["duration"].to_numpy(dtype=float)
+
+    durations = durations[
+        np.isfinite(durations) & (durations >= 0)
+    ]
+
+    # Round execution duration upward to the nearest millisecond.
+    rounded = (
+        np.ceil(durations / BILLING_ROUNDING_SECONDS)
+        * BILLING_ROUNDING_SECONDS
+    )
+
+    billable = np.maximum(
+        rounded,
+        MIN_BILLABLE_SECONDS
+    )
+
+    invocation_count = len(billable)
+
+    total_gb_seconds = np.sum(
+        billable * MEMORY_GB
+    )
+
+    execution_cost = (
+        invocation_count / 1_000_000
+    ) * EXECUTION_PRICE_PER_MILLION
+
+    resource_cost = (
+        total_gb_seconds * GB_SECOND_PRICE
+    )
+
+    return {
+        "invocation_count": invocation_count,
+        "total_gb_seconds": total_gb_seconds,
+        "execution_cost_usd": execution_cost,
+        "resource_cost_usd": resource_cost,
+        "total_cost_usd": execution_cost + resource_cost
+    }
+
+
+# ============================================================
+# EVALUATE ONE STRATEGY
+# ============================================================
+
+def evaluate_strategy(name, schedule, carbon_values):
+
+    energy = calculate_energy_and_carbon(
+        schedule, carbon_values
+    )
+
+    cost = calculate_azure_cost(schedule)
+
+    return {
+        "strategy": name,
+        **energy,
+        **cost
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("\nSCHEDULED STRATEGY EVALUATION")
+    print("=" * 45)
+
+    carbon_values = load_carbon_data()
+
+    results = []
+
+    for deadline in DEADLINES:
+
+        filename = (
+            f"forecast_assisted_schedule_{deadline}min.csv"
+        )
+
+        path = SCHEDULE_DIR / filename
+
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+        print(f"\nEvaluating {deadline}-minute scenario...")
+
+        schedule = pd.read_csv(path)
+
+        required_columns = [
+            "original_start_timestamp",
+            "scheduled_start_timestamp",
+            "duration"
+        ]
+
+        for column in required_columns:
+            if column not in schedule.columns:
+                raise ValueError(
+                    f"Missing column {column} in {filename}"
+                )
+
+        # Original execution: no scheduling delay.
+        baseline = schedule.copy()
+
+        baseline["scheduled_start_timestamp"] = (
+            baseline["original_start_timestamp"]
+        )
+
+        baseline_result = evaluate_strategy(
+            f"Baseline_{deadline}min",
+            baseline,
+            carbon_values
+        )
+
+        proposed_result = evaluate_strategy(
+            f"Forecast_Assisted_{deadline}min",
+            schedule,
+            carbon_values
+        )
+
+        # Calculate relative changes against the corresponding baseline.
+        for metric in [
+            "energy_kwh",
+            "carbon_emissions_kg",
+            "total_cost_usd"
+        ]:
+
+            original = baseline_result[metric]
+            scheduled = proposed_result[metric]
+
+            change = (
+                (original - scheduled) / original * 100
+                if original != 0 else 0
+            )
+
+            proposed_result[
+                f"{metric}_reduction_percent"
+            ] = change
+
+        results.append(baseline_result)
+        results.append(proposed_result)
+
+        print(
+            f"Energy: {baseline_result['energy_kwh']:.4f}"
+            f" -> {proposed_result['energy_kwh']:.4f} kWh"
+        )
+
+        print(
+            "Carbon: "
+            f"{baseline_result['carbon_emissions_kg']:.4f}"
+            f" -> {proposed_result['carbon_emissions_kg']:.4f} kg"
+        )
+
+        print(
+            "Cost: "
+            f"${baseline_result['total_cost_usd']:.4f}"
+            f" -> ${proposed_result['total_cost_usd']:.4f}"
+        )
+
+    result_df = pd.DataFrame(results)
+
+    output_file = OUTPUT_DIR / "strategy_evaluation.csv"
+
+    result_df.to_csv(output_file, index=False)
+
+    print("\nEVALUATION COMPLETED")
+    print("=" * 45)
+
+    display_columns = [
+        "strategy",
+        "energy_kwh",
+        "carbon_emissions_kg",
+        "total_cost_usd",
+        "maximum_concurrency",
+        "maximum_instances"
+    ]
+
+    print(
+        result_df[display_columns].to_string(index=False)
+    )
+
+    print(f"\nSaved: {output_file}")
+
+
+if __name__ == "__main__":
+    main()

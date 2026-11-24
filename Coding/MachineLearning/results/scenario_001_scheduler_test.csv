@@ -1,0 +1,5 @@
+strategy,invocations,delayed_jobs,average_wait_seconds,maximum_wait_seconds,deadline_violations,peak_concurrency,capacity_limit,exact_delayed_percentage
+BASELINE,23220,0,0.0,0.0,0,,,
+CARBON_AWARE,23220,1931,40.99561958940566,899.9992699871054,0,,,
+APPROXIMATE_CAPACITY,23220,1931,43.47803617571059,900.0,0,,,
+EXACT_CAPACITY,23220,1931,43.47803617571059,900.0,0,82.0,3027.0,28.091358743089906

@@ -1,0 +1,344 @@
+
+.recommendations-page {
+  width: 100%;
+  color: var(--text-primary);
+}
+
+.recommendations-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 26px;
+}
+
+.recommendations-header h2 {
+  font-size: 25px;
+  margin: 0 0 7px;
+}
+
+.recommendations-header p,
+.section-heading p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin: 0;
+}
+
+.model-status,
+.success-label {
+  border-radius: 20px;
+  padding: 8px 13px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+}
+
+.input-section,
+.prediction-result {
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 22px;
+  margin-bottom: 22px;
+}
+
+.section-heading,
+.result-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.section-heading h3,
+.result-heading h3 {
+  font-size: 17px;
+  margin: 0 0 7px;
+}
+
+.add-button,
+.predict-button {
+  background: var(--accent-color);
+  color: white;
+  border: none;
+  border-radius: 7px;
+  padding: 10px 15px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.add-button:hover,
+.predict-button:hover {
+  opacity: 0.88;
+}
+
+.table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.recommendation-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.carbon-table {
+  min-width: 480px;
+}
+
+.recommendation-table th {
+  text-align: left;
+  padding: 12px 10px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  background: var(--background-color);
+  border-bottom: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+
+.recommendation-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.recommendation-table input,
+.recommendation-table select {
+  width: 100%;
+  min-width: 85px;
+  padding: 9px;
+  color: var(--text-primary);
+  background: var(--background-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  outline: none;
+  font-size: 12px;
+}
+
+.recommendation-table input:focus,
+.recommendation-table select:focus {
+  border-color: var(--accent-color);
+}
+
+.remove-button {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.remove-button:hover:not(:disabled) {
+  color: #dc5555;
+  border-color: #dc5555;
+}
+
+.remove-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.table-footer {
+  margin-top: 13px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.table-footer strong {
+  color: var(--text-primary);
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin: 20px 0 28px;
+}
+
+.reset-button {
+  padding: 11px 17px;
+  border-radius: 7px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.predict-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.error-message {
+  padding: 14px;
+  margin-bottom: 20px;
+  border-radius: 8px;
+  border: 1px solid #dc5555;
+  color: #dc5555;
+  background: rgba(220, 85, 85, 0.07);
+  font-size: 13px;
+}
+
+.prediction-result {
+  margin-top: 25px;
+}
+
+.result-eyebrow {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--accent-color);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+
+.success-label {
+  color: #239b69;
+  border-color: #239b69;
+}
+
+.result-cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 13px;
+  margin: 20px 0;
+}
+
+.result-card {
+  padding: 17px;
+  background: var(--background-color);
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  min-width: 0;
+}
+
+.result-card span {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-bottom: 10px;
+}
+
+.result-card h2 {
+  margin: 0;
+  font-size: 20px;
+  overflow-wrap: anywhere;
+}
+
+.strategy-card h2 {
+  color: var(--accent-color);
+}
+
+.result-details {
+  padding: 14px 0;
+  border-top: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.result-details p {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.result-details strong {
+  color: var(--text-primary);
+}
+
+.derived-features {
+  margin-top: 22px;
+}
+
+.derived-features h4,
+.comparison-notice h4 {
+  margin: 0 0 14px;
+  font-size: 14px;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.feature-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 11px;
+  background: var(--background-color);
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  min-width: 0;
+}
+
+.feature-item span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-transform: capitalize;
+  overflow-wrap: anywhere;
+}
+
+.feature-item strong {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.comparison-notice {
+  margin-top: 22px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+.comparison-notice p {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+@media (max-width: 1000px) {
+  .result-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .feature-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .recommendations-header,
+  .section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .input-section,
+  .prediction-result {
+    padding: 14px;
+  }
+
+  .result-cards,
+  .feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-actions {
+    flex-direction: column;
+  }
+
+  .form-actions button {
+    width: 100%;
+  }
+}

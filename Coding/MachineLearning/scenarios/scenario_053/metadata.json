@@ -1,0 +1,18 @@
+{
+    "scenario_id": "scenario_053",
+    "scenario_type": "original_trace_window",
+    "window_start_minute": 18720,
+    "window_end_minute": 19080,
+    "window_duration_minutes": 360,
+    "carbon_lookahead_minutes": 60,
+    "job_count": 20822,
+    "immediate_jobs": 14607,
+    "delay_tolerant_jobs": 6215,
+    "mean_duration_seconds": 8.943181058495822,
+    "mean_carbon_intensity": 692.4128571428571,
+    "deadlines_minutes": [
+        15,
+        30,
+        60
+    ]
+}
